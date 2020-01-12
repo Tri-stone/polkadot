@@ -1,4 +1,4 @@
-// Copyright 2017 Parity Technologies (UK) Ltd.
+// Copyright 2017-2020 Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -26,57 +26,59 @@ pub mod validation;
 pub mod gossip;
 
 use codec::{Decode, Encode};
-use futures::sync::oneshot;
+use futures::channel::oneshot;
 use futures::prelude::*;
-use futures03::{channel::mpsc, compat::Compat, StreamExt};
 use polkadot_primitives::{Block, Hash, Header};
 use polkadot_primitives::parachain::{
-	Id as ParaId, BlockData, CollatorId, CandidateReceipt, Collation, PoVBlock,
-	StructuredUnroutedIngress, ValidatorId, OutgoingMessages,
+	Id as ParaId, CollatorId, CandidateReceipt, Collation, PoVBlock,
+	StructuredUnroutedIngress, ValidatorId, OutgoingMessages, ErasureChunk,
 };
-use substrate_network::{
+use sc_network::{
 	PeerId, RequestId, Context, StatusMessage as GenericFullStatus,
-	specialization::{Event, NetworkSpecialization as Specialization},
+	specialization::NetworkSpecialization as Specialization,
 };
-use substrate_network::consensus_gossip::{
-	self, TopicNotification, MessageRecipient as GossipMessageRecipient, ConsensusMessage,
-};
+use sc_network_gossip::TopicNotification;
 use self::validation::{LiveValidationLeaves, RecentValidatorIds, InsertedRecentKey};
 use self::collator_pool::{CollatorPool, Role, Action};
 use self::local_collations::LocalCollations;
 use log::{trace, debug, warn};
 
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
+use std::task::{Context as PollContext, Poll};
 
-use crate::gossip::{POLKADOT_ENGINE_ID, GossipMessage};
+use crate::gossip::{GossipMessage, ErasureChunkMessage, RegisteredMessageValidator};
 
 #[cfg(test)]
 mod tests;
 
 mod cost {
-	pub(super) const UNEXPECTED_MESSAGE: i32 = -200;
-	pub(super) const INVALID_FORMAT: i32 = -200;
+	use sc_network::ReputationChange as Rep;
+	pub(super) const UNEXPECTED_MESSAGE: Rep = Rep::new(-200, "Polkadot: Unexpected message");
+	pub(super) const UNEXPECTED_ROLE: Rep = Rep::new(-200, "Polkadot: Unexpected role");
+	pub(super) const INVALID_FORMAT: Rep = Rep::new(-200, "Polkadot: Bad message");
 
-	pub(super) const UNKNOWN_PEER: i32 = -50;
-	pub(super) const COLLATOR_ALREADY_KNOWN: i32 = -100;
-	pub(super) const BAD_COLLATION: i32 = -1000;
-	pub(super) const BAD_POV_BLOCK: i32 = -1000;
+	pub(super) const UNKNOWN_PEER: Rep = Rep::new(-50, "Polkadot: Unknown peer");
+	pub(super) const COLLATOR_ALREADY_KNOWN: Rep = Rep::new( -100, "Polkadot: Known collator");
+	pub(super) const BAD_COLLATION: Rep = Rep::new(-1000, "Polkadot: Bad collation");
+	pub(super) const BAD_POV_BLOCK: Rep = Rep::new(-1000, "Polkadot: Bad POV block");
 }
 
 mod benefit {
-	pub(super) const EXPECTED_MESSAGE: i32 = 20;
-	pub(super) const VALID_FORMAT: i32 = 20;
+	use sc_network::ReputationChange as Rep;
+	pub(super) const EXPECTED_MESSAGE: Rep = Rep::new(20, "Polkadot: Expected message");
+	pub(super) const VALID_FORMAT: Rep = Rep::new(20, "Polkadot: Valid message format");
 
-	pub(super) const KNOWN_PEER: i32 = 5;
-	pub(super) const NEW_COLLATOR: i32 = 10;
-	pub(super) const GOOD_COLLATION: i32 = 100;
-	pub(super) const GOOD_POV_BLOCK: i32 = 100;
+	pub(super) const KNOWN_PEER: Rep = Rep::new(5, "Polkadot: Known peer");
+	pub(super) const NEW_COLLATOR: Rep = Rep::new(10, "Polkadot: New collator");
+	pub(super) const GOOD_COLLATION: Rep = Rep::new(100, "Polkadot: Good collation");
+	pub(super) const GOOD_POV_BLOCK: Rep = Rep::new(100, "Polkadot: Good POV block");
 }
 
 type FullStatus = GenericFullStatus<Block>;
 
 /// Specialization of the network service for the polkadot protocol.
-pub type PolkadotNetworkService = substrate_network::NetworkService<Block, PolkadotProtocol, Hash>;
+pub type PolkadotNetworkService = sc_network::NetworkService<Block, PolkadotProtocol, Hash>;
 
 /// Basic functionality that a network has to fulfill.
 pub trait NetworkService: Send + Sync + 'static {
@@ -86,78 +88,67 @@ pub trait NetworkService: Send + Sync + 'static {
 	/// Gossip a message on given topic.
 	fn gossip_message(&self, topic: Hash, message: GossipMessage);
 
-	/// Execute a closure with the gossip service.
-	fn with_gossip<F: Send + 'static>(&self, with: F)
-		where F: FnOnce(&mut dyn GossipService, &mut dyn Context<Block>);
+	/// Send a message to a specific peer we're connected to.
+	fn send_message(&self, who: PeerId, message: GossipMessage);
 
 	/// Execute a closure with the polkadot protocol.
 	fn with_spec<F: Send + 'static>(&self, with: F)
-		where F: FnOnce(&mut PolkadotProtocol, &mut dyn Context<Block>);
+		where Self: Sized, F: FnOnce(&mut PolkadotProtocol, &mut dyn Context<Block>);
 }
 
-impl NetworkService for PolkadotNetworkService {
-	fn gossip_messages_for(&self, topic: Hash) -> GossipMessageStream {
-		let (tx, rx) = std::sync::mpsc::channel();
+/// This is a newtype that implements a [`ProvideGossipMessages`] shim trait.
+///
+/// For any wrapped [`NetworkService`] type it implements a [`ProvideGossipMessages`].
+/// For more details see documentation of [`ProvideGossipMessages`].
+///
+/// [`NetworkService`]: ./trait.NetworkService.html
+/// [`ProvideGossipMessages`]: ../polkadot_availability_store/trait.ProvideGossipMessages.html
+#[derive(Clone)]
+pub struct AvailabilityNetworkShim(pub RegisteredMessageValidator);
 
-		PolkadotNetworkService::with_gossip(self, move |gossip, _| {
-			let inner_rx = gossip.messages_for(POLKADOT_ENGINE_ID, topic);
-			let _ = tx.send(inner_rx);
-		});
-
-		let topic_stream = match rx.recv() {
-			Ok(rx) => rx,
-			Err(_) => mpsc::unbounded().1, // return empty channel.
-		};
-
-		GossipMessageStream::new(Box::new(Compat::new(topic_stream.map(Ok))))
+impl av_store::ProvideGossipMessages for AvailabilityNetworkShim {
+	fn gossip_messages_for(&self, topic: Hash)
+		-> Pin<Box<dyn Stream<Item = (Hash, Hash, ErasureChunk)> + Send>>
+	{
+		self.0.gossip_messages_for(topic)
+			.filter_map(|(msg, _)| async move {
+				match msg {
+					GossipMessage::ErasureChunk(chunk) => {
+						Some((chunk.relay_parent, chunk.candidate_hash, chunk.chunk))
+					},
+					_ => None,
+				}
+			})
+			.boxed()
 	}
 
-	fn gossip_message(&self, topic: Hash, message: GossipMessage) {
-		self.gossip_consensus_message(
+	fn gossip_erasure_chunk(
+		&self,
+		relay_parent: Hash,
+		candidate_hash: Hash,
+		erasure_root: Hash,
+		chunk: ErasureChunk
+	) {
+		let topic = av_store::erasure_coding_topic(relay_parent, erasure_root, chunk.index);
+		self.0.gossip_message(
 			topic,
-			POLKADOT_ENGINE_ID,
-			message.encode(),
-			GossipMessageRecipient::BroadcastToAll,
-		);
-	}
-
-	fn with_gossip<F: Send + 'static>(&self, with: F)
-		where F: FnOnce(&mut dyn GossipService, &mut dyn Context<Block>)
-	{
-		PolkadotNetworkService::with_gossip(self, move |gossip, ctx| with(gossip, ctx))
-	}
-
-	fn with_spec<F: Send + 'static>(&self, with: F)
-		where F: FnOnce(&mut PolkadotProtocol, &mut dyn Context<Block>)
-	{
-		PolkadotNetworkService::with_spec(self, with)
-	}
-}
-
-/// A gossip network subservice.
-pub trait GossipService {
-	fn send_message(&mut self, ctx: &mut dyn Context<Block>, who: &PeerId, message: ConsensusMessage);
-	fn multicast(&mut self, ctx: &mut dyn Context<Block>, topic: &Hash, message: ConsensusMessage);
-}
-
-impl GossipService for consensus_gossip::ConsensusGossip<Block> {
-	fn send_message(&mut self, ctx: &mut dyn Context<Block>, who: &PeerId, message: ConsensusMessage) {
-		consensus_gossip::ConsensusGossip::send_message(self, ctx, who, message)
-	}
-
-	fn multicast(&mut self, ctx: &mut dyn Context<Block>, topic: &Hash, message: ConsensusMessage) {
-		consensus_gossip::ConsensusGossip::multicast(self, ctx, *topic, message, false)
+			GossipMessage::ErasureChunk(ErasureChunkMessage {
+				chunk,
+				relay_parent,
+				candidate_hash,
+			})
+		)
 	}
 }
 
 /// A stream of gossip messages and an optional sender for a topic.
 pub struct GossipMessageStream {
-	topic_stream: Box<dyn Stream<Item = TopicNotification, Error = ()> + Send>,
+	topic_stream: Pin<Box<dyn Stream<Item = TopicNotification> + Send>>,
 }
 
 impl GossipMessageStream {
 	/// Create a new instance with the given topic stream.
-	pub fn new(topic_stream: Box<dyn Stream<Item = TopicNotification, Error = ()> + Send>) -> Self {
+	pub fn new(topic_stream: Pin<Box<dyn Stream<Item = TopicNotification> + Send>>) -> Self {
 		Self {
 			topic_stream,
 		}
@@ -166,18 +157,20 @@ impl GossipMessageStream {
 
 impl Stream for GossipMessageStream {
 	type Item = (GossipMessage, Option<PeerId>);
-	type Error = ();
 
-	fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+	fn poll_next(self: Pin<&mut Self>, cx: &mut PollContext) -> Poll<Option<Self::Item>> {
+		let this = Pin::into_inner(self);
+
 		loop {
-			let msg = match futures::try_ready!(self.topic_stream.poll()) {
-				Some(msg) => msg,
-				None => return Ok(Async::Ready(None)),
+			let msg = match Pin::new(&mut this.topic_stream).poll_next(cx) {
+				Poll::Ready(Some(msg)) => msg,
+				Poll::Ready(None) => return Poll::Ready(None),
+				Poll::Pending => return Poll::Pending,
 			};
 
 			debug!(target: "validation", "Processing statement for live validation leaf-work");
 			if let Ok(gmsg) = GossipMessage::decode(&mut &msg.message[..]) {
-				return Ok(Async::Ready(Some((gmsg, msg.sender))))
+				return Poll::Ready(Some((gmsg, msg.sender)))
 			}
 		}
 	}
@@ -277,10 +270,6 @@ pub enum Message {
 	RequestPovBlock(RequestId, Hash, Hash),
 	/// Provide requested proof-of-validation block data by candidate hash or nothing if unknown.
 	PovBlock(RequestId, Option<PoVBlock>),
-	/// Request block data (relay_parent, candidate_hash)
-	RequestBlockData(RequestId, Hash, Hash),
-	/// Provide requested block data by candidate hash or nothing.
-	BlockData(RequestId, Option<BlockData>),
 	/// Tell a collator their role.
 	CollatorRole(Role),
 	/// A collation provided by a peer. Relay parent and collation.
@@ -441,24 +430,7 @@ impl PolkadotProtocol {
 
 				send_polkadot_message(ctx, who, Message::PovBlock(req_id, pov_block));
 			}
-			Message::RequestBlockData(req_id, relay_parent, candidate_hash) => {
-				let block_data = self.live_validation_leaves
-					.with_pov_block(
-						&relay_parent,
-						&candidate_hash,
-						|res| res.ok().map(|b| b.block_data.clone()),
-					)
-					.or_else(|| self.availability_store.as_ref()
-						.and_then(|s| s.block_data(relay_parent, candidate_hash))
-					);
-
-				send_polkadot_message(ctx, who, Message::BlockData(req_id, block_data));
-			}
 			Message::PovBlock(req_id, data) => self.on_pov_block(ctx, who, req_id, data),
-			Message::BlockData(_req_id, _data) => {
-				// current block data is never requested bare by the node.
-				ctx.report_peer(who, cost::UNEXPECTED_MESSAGE);
-			}
 			Message::Collation(relay_parent, collation) => self.on_collation(ctx, who, relay_parent, collation),
 			Message::CollatorRole(role) => self.on_new_role(ctx, who, role),
 		}
@@ -553,7 +525,7 @@ impl PolkadotProtocol {
 		debug!(target: "p_net", "New collator role {:?} from {}", role, who);
 
 		if info.validator_keys.as_slice().is_empty() {
-			ctx.report_peer(who, cost::UNEXPECTED_MESSAGE);
+			ctx.report_peer(who, cost::UNEXPECTED_ROLE)
 		} else {
 			// update role for all saved session keys for this validator.
 			let local_collations = &mut self.local_collations;
@@ -588,7 +560,7 @@ impl Specialization<Block> for PolkadotProtocol {
 		let local_status = Status::decode(&mut &status.chain_status[..])
 			.unwrap_or_else(|_| Status { collating_for: None });
 
-		let validator = status.roles.contains(substrate_network::config::Roles::AUTHORITY);
+		let validator = status.roles.contains(sc_network::config::Roles::AUTHORITY);
 
 		let mut peer_info = PeerInfo {
 			collating_for: local_status.collating_for.clone(),
@@ -694,10 +666,6 @@ impl Specialization<Block> for PolkadotProtocol {
 		}
 	}
 
-	fn on_event(&mut self, _event: Event) { }
-
-	fn on_abort(&mut self) { }
-
 	fn maintain_peers(&mut self, ctx: &mut dyn Context<Block>) {
 		self.collators.collect_garbage(None);
 		self.local_collations.collect_garbage(None);
@@ -732,8 +700,8 @@ impl PolkadotProtocol {
 		relay_parent: Hash,
 		collation: Collation
 	) {
-		let collation_para = collation.receipt.parachain_index;
-		let collated_acc = collation.receipt.collator.clone();
+		let collation_para = collation.info.parachain_index;
+		let collated_acc = collation.info.collator.clone();
 
 		match self.peers.get(&from) {
 			None => ctx.report_peer(from, cost::UNKNOWN_PEER),
@@ -744,7 +712,7 @@ impl PolkadotProtocol {
 					Some((ref acc_id, ref para_id)) => {
 						ctx.report_peer(from.clone(), benefit::EXPECTED_MESSAGE);
 						let structurally_valid = para_id == &collation_para && acc_id == &collated_acc;
-						if structurally_valid && collation.receipt.check_signature().is_ok() {
+						if structurally_valid && collation.info.check_signature().is_ok() {
 							debug!(target: "p_net", "Received collation for parachain {:?} from peer {}", para_id, from);
 							ctx.report_peer(from, benefit::GOOD_COLLATION);
 							self.collators.on_collation(acc_id.clone(), relay_parent, collation)
@@ -799,23 +767,9 @@ impl PolkadotProtocol {
 		targets: HashSet<ValidatorId>,
 		collation: Collation,
 		outgoing_targeted: OutgoingMessages,
-	) -> std::io::Result<()> {
+	) -> impl Future<Output = ()> {
 		debug!(target: "p_net", "Importing local collation on relay parent {:?} and parachain {:?}",
-			relay_parent, collation.receipt.parachain_index);
-
-		let outgoing_queues = polkadot_validation::outgoing_queues(&outgoing_targeted)
-			.map(|(_target, root, data)| (root, data))
-			.collect();
-
-		if let Some(ref availability_store) = self.availability_store {
-			availability_store.make_available(av_store::Data {
-				relay_parent,
-				parachain_id: collation.receipt.parachain_index,
-				candidate_hash: collation.receipt.hash(),
-				block_data: collation.pov.block_data.clone(),
-				outgoing_queues: Some(outgoing_queues),
-			})?;
-		}
+			relay_parent, collation.info.parachain_index);
 
 		for (primary, cloned_collation) in self.local_collations.add_collation(relay_parent, targets, collation.clone()) {
 			match self.validators.get(&primary) {
@@ -832,7 +786,19 @@ impl PolkadotProtocol {
 			}
 		}
 
-		Ok(())
+		let availability_store = self.availability_store.clone();
+		let collation_cloned = collation.clone();
+
+		async move {
+			if let Some(availability_store) = availability_store {
+				let _ = availability_store.make_available(av_store::Data {
+					relay_parent,
+					parachain_id: collation_cloned.info.parachain_index,
+					block_data: collation_cloned.pov.block_data.clone(),
+					outgoing_queues: Some(outgoing_targeted.clone().into()),
+				}).await;
+			}
+		}
 	}
 
 	/// Give the network protocol a handle to an availability store, used for

@@ -1,4 +1,4 @@
-// Copyright 2017 Parity Technologies (UK) Ltd.
+// Copyright 2017-2020 Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -29,48 +29,63 @@
 //!
 //! Groups themselves may be compromised by malicious authorities.
 
-use std::{collections::{HashMap, HashSet}, pin::Pin, sync::Arc, time::{self, Duration, Instant}};
+use std::{
+	collections::{HashMap, HashSet},
+	pin::Pin,
+	sync::Arc,
+	time::{self, Duration, Instant},
+};
 
 use babe_primitives::BabeApi;
-use client::{BlockchainEvents, BlockBody};
-use client::blockchain::HeaderBackend;
-use client::block_builder::api::BlockBuilder as BlockBuilderApi;
-use client::error as client_error;
+use sc_client_api::{Backend, BlockchainEvents, BlockBody};
+use sp_blockchain::HeaderBackend;
+use block_builder::BlockBuilderApi;
 use codec::Encode;
-use consensus::SelectChain;
+use consensus::{SelectChain, Proposal, RecordProof};
 use availability_store::Store as AvailabilityStore;
 use parking_lot::Mutex;
 use polkadot_primitives::{Hash, Block, BlockId, BlockNumber, Header};
 use polkadot_primitives::parachain::{
-	Id as ParaId, Chain, DutyRoster, OutgoingMessages, CandidateReceipt,
-	ParachainHost, AttestedCandidate, Statement as PrimitiveStatement, Message,
-	Collation, PoVBlock, ValidatorSignature, ValidatorPair, ValidatorId
+	Id as ParaId, Chain, DutyRoster, CandidateReceipt,
+	ParachainHost, AttestedCandidate, Statement as PrimitiveStatement, Message, OutgoingMessages,
+	Collation, PoVBlock, ErasureChunk, ValidatorSignature, ValidatorIndex,
+	ValidatorPair, ValidatorId, NEW_HEADS_IDENTIFIER,
 };
 use primitives::Pair;
-use runtime_primitives::traits::{ProvideRuntimeApi, DigestFor};
-use futures_timer::{Delay, Interval};
-use transaction_pool::txpool::{Pool, ChainApi as PoolChainApi};
+use runtime_primitives::traits::{DigestFor, HasherFor};
+use futures_timer::Delay;
+use txpool_api::{TransactionPool, InPoolTransaction};
 
 use attestation_service::ServiceHandle;
 use futures::prelude::*;
-use futures03::{future::{self, Either, FutureExt}, task::Context, stream::StreamExt};
-use collation::CollationFetch;
+use futures::{future::{select, ready}, stream::unfold, task::{Spawn, SpawnExt}};
+use collation::collation_fetch;
 use dynamic_inclusion::DynamicInclusion;
 use inherents::InherentData;
-use runtime_babe::timestamp::TimestampInherentData;
+use sp_timestamp::TimestampInherentData;
 use log::{info, debug, warn, trace, error};
 use keystore::KeyStorePtr;
+use sp_api::{ApiExt, ProvideRuntimeApi};
 
-type TaskExecutor = Arc<dyn futures::future::Executor<Box<dyn Future<Item = (), Error = ()> + Send>> + Send + Sync>;
+type TaskExecutor = Arc<dyn Spawn + Send + Sync>;
+
+fn interval(duration: Duration) -> impl Stream<Item=()> + Send + Unpin {
+	unfold((), move |_| {
+		futures_timer::Delay::new(duration).map(|_| Some(((), ())))
+	}).map(drop)
+}
 
 pub use self::collation::{
 	validate_collation, validate_incoming, message_queue_root, egress_roots, Collators,
+	produce_receipt_and_chunks,
 };
 pub use self::error::Error;
 pub use self::shared_table::{
 	SharedTable, ParachainWork, PrimedParachainWork, Validated, Statement, SignedStatement,
 	GenericStatement,
 };
+
+#[cfg(not(target_os = "unknown"))]
 pub use parachain::wasm_executor::{run_worker as run_validation_worker};
 
 mod attestation_service;
@@ -94,11 +109,17 @@ pub trait TableRouter: Clone {
 	/// Errors when fetching data from the network.
 	type Error: std::fmt::Debug;
 	/// Future that resolves when candidate data is fetched.
-	type FetchValidationProof: IntoFuture<Item=PoVBlock,Error=Self::Error>;
+	type FetchValidationProof: Future<Output=Result<PoVBlock, Self::Error>>;
 
 	/// Call with local candidate data. This will make the data available on the network,
 	/// and sign, import, and broadcast a statement about the candidate.
-	fn local_collation(&self, collation: Collation, outgoing: OutgoingMessages);
+	fn local_collation(
+		&self,
+		collation: Collation,
+		receipt: CandidateReceipt,
+		outgoing: OutgoingMessages,
+		chunks: (ValidatorIndex, &[ErasureChunk]),
+	);
 
 	/// Fetch validation proof for a specific candidate.
 	fn fetch_pov_block(&self, candidate: &CandidateReceipt) -> Self::FetchValidationProof;
@@ -115,7 +136,7 @@ pub trait Network {
 
 	/// The future used for asynchronously building the table router.
 	/// This should not fail.
-	type BuildTableRouter: IntoFuture<Item=Self::TableRouter,Error=Self::Error>;
+	type BuildTableRouter: Future<Output=Result<Self::TableRouter,Self::Error>>;
 
 	/// Instantiate a table router using the given shared table.
 	/// Also pass through any outgoing messages to be broadcast to peers.
@@ -150,7 +171,12 @@ pub fn sign_table_statement(statement: &Statement, key: &ValidatorPair, parent_h
 }
 
 /// Check signature on table statement.
-pub fn check_statement(statement: &Statement, signature: &ValidatorSignature, signer: ValidatorId, parent_hash: &Hash) -> bool {
+pub fn check_statement(
+	statement: &Statement,
+	signature: &ValidatorSignature,
+	signer: ValidatorId,
+	parent_hash: &Hash,
+) -> bool {
 	use runtime_primitives::traits::AppVerify;
 
 	let mut encoded = PrimitiveStatement::from(statement.clone()).encode();
@@ -173,12 +199,14 @@ pub fn make_group_info(
 	}
 
 	let mut local_validation = None;
+	let mut local_index = 0;
 	let mut map = HashMap::new();
 
 	let duty_iter = authorities.iter().zip(&roster.validator_duty);
-	for (authority, v_duty) in duty_iter {
+	for (i, (authority, v_duty)) in duty_iter.enumerate() {
 		if Some(authority) == local_id.as_ref() {
 			local_validation = Some(v_duty.clone());
+			local_index = i;
 		}
 
 		match *v_duty {
@@ -198,7 +226,8 @@ pub fn make_group_info(
 
 
 	let local_duty = local_validation.map(|v| LocalDuty {
-		validation: v
+		validation: v,
+		index: local_index as u32,
 	});
 
 	Ok((map, local_duty))
@@ -246,13 +275,15 @@ struct ParachainValidation<C, N, P> {
 }
 
 impl<C, N, P> ParachainValidation<C, N, P> where
-	C: Collators + Send + 'static,
+	C: Collators + Send + Unpin + 'static,
 	N: Network,
-	P: ProvideRuntimeApi + HeaderBackend<Block> + BlockBody<Block> + Send + Sync + 'static,
-	P::Api: ParachainHost<Block> + BlockBuilderApi<Block>,
-	<C::Collation as IntoFuture>::Future: Send + 'static,
+	P: ProvideRuntimeApi<Block> + HeaderBackend<Block> + BlockBody<Block> + Send + Sync + 'static,
+	P::Api: ParachainHost<Block> + BlockBuilderApi<Block> + ApiExt<Block, Error = sp_blockchain::Error>,
+	C::Collation: Send + Unpin + 'static,
 	N::TableRouter: Send + 'static,
-	<N::BuildTableRouter as IntoFuture>::Future: Send + 'static,
+	N::BuildTableRouter: Unpin + Send + 'static,
+	// Rust bug: https://github.com/rust-lang/rust/issues/24159
+	sp_api::StateBackendFor<P, Block>: sp_api::StateBackend<HasherFor<Block>>,
 {
 	/// Get an attestation table for given parent hash.
 	///
@@ -297,6 +328,21 @@ impl<C, N, P> ParachainValidation<C, N, P> where
 
 		debug!(target: "validation", "Active parachains: {:?}", active_parachains);
 
+		// If we are a validator, we need to store our index in this round in availability store.
+		// This will tell which erasure chunk we should store.
+		if let Some(ref local_duty) = local_duty {
+			if let Err(e) = self.availability_store.add_validator_index_and_n_validators(
+				&parent_hash,
+				local_duty.index,
+				validators.len() as u32,
+			) {
+				warn!(
+					target: "validation",
+					"Failed to add validator index and n_validators to the availability-store: {:?}", e
+				)
+			}
+		}
+
 		let table = Arc::new(SharedTable::new(
 			validators.clone(),
 			group_info,
@@ -314,8 +360,8 @@ impl<C, N, P> ParachainValidation<C, N, P> where
 			exit.clone(),
 		);
 
-		if let Some(Chain::Parachain(id)) = local_duty.as_ref().map(|d| d.validation) {
-			self.launch_work(parent_hash, id, router, max_block_data_size, exit);
+		if let Some((Chain::Parachain(id), index)) = local_duty.as_ref().map(|d| (d.validation, d.index)) {
+			self.launch_work(parent_hash, id, router, max_block_data_size, validators.len(), index, exit);
 		}
 
 		let tracker = Arc::new(AttestationTracker {
@@ -341,70 +387,81 @@ impl<C, N, P> ParachainValidation<C, N, P> where
 		validation_para: ParaId,
 		build_router: N::BuildTableRouter,
 		max_block_data_size: Option<u64>,
+		authorities_num: usize,
+		local_id: ValidatorIndex,
 		exit: exit_future::Exit,
 	) {
-		use availability_store::Data;
-
 		let (collators, client) = (self.collators.clone(), self.client.clone());
 		let availability_store = self.availability_store.clone();
 
 		let with_router = move |router: N::TableRouter| {
 			// fetch a local collation from connected collators.
-			let collation_work = CollationFetch::new(
+			let collation_work = collation_fetch(
 				validation_para,
 				relay_parent,
 				collators,
-				client,
+				client.clone(),
 				max_block_data_size,
 			);
 
-			collation_work.then(move |result| match result {
-				Ok((collation, outgoing_targeted)) => {
-					let outgoing_queues = crate::outgoing_queues(&outgoing_targeted)
-						.map(|(_target, root, data)| (root, data))
-						.collect();
+			collation_work.map(move |result| match result {
+				Ok((collation, outgoing_targeted, fees_charged)) => {
+					match produce_receipt_and_chunks(
+						authorities_num,
+						&collation.pov,
+						&outgoing_targeted,
+						fees_charged,
+						&collation.info,
+					) {
+						Ok((receipt, chunks)) => {
+							// Apparently the `async move` block is the only way to convince
+							// the compiler that we are not moving values out of borrowed context.
+							let av_clone = availability_store.clone();
+							let chunks_clone = chunks.clone();
+							let receipt_clone = receipt.clone();
 
-					let res = availability_store.make_available(Data {
-						relay_parent,
-						parachain_id: collation.receipt.parachain_index,
-						candidate_hash: collation.receipt.hash(),
-						block_data: collation.pov.block_data.clone(),
-						outgoing_queues: Some(outgoing_queues),
-					});
+							let res = async move {
+								if let Err(e) = av_clone.clone().add_erasure_chunks(
+									relay_parent.clone(),
+									receipt_clone,
+									chunks_clone,
+								).await {
+									warn!(target: "validation", "Failed to add erasure chunks: {}", e);
+								}
+							}
+							.unit_error()
+							.boxed()
+							.then(move |_| {
+								router.local_collation(collation, receipt, outgoing_targeted, (local_id, &chunks));
+								ready(())
+							});
 
-					match res {
-						Ok(()) => {
-							// TODO: https://github.com/paritytech/polkadot/issues/51
-							// Erasure-code and provide merkle branches.
-							router.local_collation(collation, outgoing_targeted);
+
+							Some(res)
 						}
-						Err(e) => warn!(
-							target: "validation",
-							"Failed to make collation data available: {:?}",
-							e,
-						),
+						Err(e) => {
+							warn!(target: "validation", "Failed to produce a receipt: {:?}", e);
+							None
+						}
 					}
-
-					Ok(())
 				}
 				Err(e) => {
 					warn!(target: "validation", "Failed to collate candidate: {:?}", e);
-					Ok(())
+					None
 				}
 			})
 		};
 
-		let cancellable_work = build_router
-			.into_future()
+		let router = build_router
+			.map_ok(with_router)
 			.map_err(|e| {
 				warn!(target: "validation" , "Failed to build table router: {:?}", e);
-			})
-			.and_then(with_router)
-			.select(exit)
-			.then(|_| Ok(()));
+			});
+
+		let cancellable_work = select(exit, router).map(drop);
 
 		// spawn onto thread pool.
-		if self.handle.execute(Box::new(cancellable_work)).is_err() {
+		if self.handle.spawn(cancellable_work).is_err() {
 			error!("Failed to spawn cancellable work task");
 		}
 	}
@@ -418,27 +475,33 @@ struct AttestationTracker {
 }
 
 /// Polkadot proposer factory.
-pub struct ProposerFactory<C, N, P, SC, TxApi: PoolChainApi> {
+pub struct ProposerFactory<C, N, P, SC, TxPool, B> {
 	parachain_validation: Arc<ParachainValidation<C, N, P>>,
-	transaction_pool: Arc<Pool<TxApi>>,
+	transaction_pool: Arc<TxPool>,
 	keystore: KeyStorePtr,
 	_service_handle: ServiceHandle,
 	babe_slot_duration: u64,
 	_select_chain: SC,
 	max_block_data_size: Option<u64>,
+	backend: Arc<B>,
 }
 
-impl<C, N, P, SC, TxApi> ProposerFactory<C, N, P, SC, TxApi> where
-	C: Collators + Send + Sync + 'static,
-	<C::Collation as IntoFuture>::Future: Send + 'static,
+impl<C, N, P, SC, TxPool, B> ProposerFactory<C, N, P, SC, TxPool, B> where
+	C: Collators + Send + Sync + Unpin + 'static,
+	C::Collation: Send + Unpin + 'static,
 	P: BlockchainEvents<Block> + BlockBody<Block>,
-	P: ProvideRuntimeApi + HeaderBackend<Block> + Send + Sync + 'static,
-	P::Api: ParachainHost<Block> + BlockBuilderApi<Block> + BabeApi<Block>,
+	P: ProvideRuntimeApi<Block> + HeaderBackend<Block> + Send + Sync + 'static,
+	P::Api: ParachainHost<Block> +
+		BlockBuilderApi<Block> +
+		BabeApi<Block> +
+		ApiExt<Block, Error = sp_blockchain::Error>,
 	N: Network + Send + Sync + 'static,
 	N::TableRouter: Send + 'static,
-	<N::BuildTableRouter as IntoFuture>::Future: Send + 'static,
-	TxApi: PoolChainApi,
+	N::BuildTableRouter: Send + Unpin + 'static,
+	TxPool: TransactionPool,
 	SC: SelectChain<Block> + 'static,
+	// Rust bug: https://github.com/rust-lang/rust/issues/24159
+	sp_api::StateBackendFor<P, Block>: sp_api::StateBackend<HasherFor<Block>>,
 {
 	/// Create a new proposer factory.
 	pub fn new(
@@ -446,12 +509,13 @@ impl<C, N, P, SC, TxApi> ProposerFactory<C, N, P, SC, TxApi> where
 		_select_chain: SC,
 		network: N,
 		collators: C,
-		transaction_pool: Arc<Pool<TxApi>>,
+		transaction_pool: Arc<TxPool>,
 		thread_pool: TaskExecutor,
 		keystore: KeyStorePtr,
 		availability_store: AvailabilityStore,
 		babe_slot_duration: u64,
 		max_block_data_size: Option<u64>,
+		backend: Arc<B>,
 	) -> Self {
 		let parachain_validation = Arc::new(ParachainValidation {
 			client: client.clone(),
@@ -468,7 +532,6 @@ impl<C, N, P, SC, TxApi> ProposerFactory<C, N, P, SC, TxApi> where
 			parachain_validation.clone(),
 			thread_pool,
 			keystore.clone(),
-			availability_store,
 			max_block_data_size,
 		);
 
@@ -480,22 +543,29 @@ impl<C, N, P, SC, TxApi> ProposerFactory<C, N, P, SC, TxApi> where
 			babe_slot_duration,
 			_select_chain,
 			max_block_data_size,
+			backend,
 		}
 	}
 }
 
-impl<C, N, P, SC, TxApi> consensus::Environment<Block> for ProposerFactory<C, N, P, SC, TxApi> where
-	C: Collators + Send + 'static,
+impl<C, N, P, SC, TxPool, B> consensus::Environment<Block> for ProposerFactory<C, N, P, SC, TxPool, B> where
+	C: Collators + Send + Unpin + 'static,
 	N: Network,
-	TxApi: PoolChainApi<Block=Block>,
-	P: ProvideRuntimeApi + HeaderBackend<Block> + BlockBody<Block> + Send + Sync + 'static,
-	P::Api: ParachainHost<Block> + BlockBuilderApi<Block> + BabeApi<Block>,
-	<C::Collation as IntoFuture>::Future: Send + 'static,
+	TxPool: TransactionPool<Block=Block> + 'static,
+	P: ProvideRuntimeApi<Block> + HeaderBackend<Block> + BlockBody<Block> + Send + Sync + 'static,
+	P::Api: ParachainHost<Block> +
+		BlockBuilderApi<Block> +
+		BabeApi<Block> +
+		ApiExt<Block, Error = sp_blockchain::Error>,
+	C::Collation: Send + Unpin + 'static,
 	N::TableRouter: Send + 'static,
-	<N::BuildTableRouter as IntoFuture>::Future: Send + 'static,
+	N::BuildTableRouter: Send + Unpin + 'static,
 	SC: SelectChain<Block>,
+	B: Backend<Block, State = sp_api::StateBackendFor<P, Block>> + 'static,
+	// Rust bug: https://github.com/rust-lang/rust/issues/24159
+	sp_api::StateBackendFor<P, Block>: sp_api::StateBackend<HasherFor<Block>> + Send,
 {
-	type Proposer = Proposer<P, TxApi>;
+	type Proposer = Proposer<P, TxPool, B>;
 	type Error = Error;
 
 	fn init(
@@ -519,6 +589,7 @@ impl<C, N, P, SC, TxApi> consensus::Environment<Block> for ProposerFactory<C, N,
 			parent_number: parent_header.number,
 			transaction_pool: self.transaction_pool.clone(),
 			slot_duration: self.babe_slot_duration,
+			backend: self.backend.clone(),
 		})
 	}
 }
@@ -527,35 +598,44 @@ impl<C, N, P, SC, TxApi> consensus::Environment<Block> for ProposerFactory<C, N,
 #[derive(Debug)]
 pub struct LocalDuty {
 	validation: Chain,
+	index: ValidatorIndex,
 }
 
 /// The Polkadot proposer logic.
-pub struct Proposer<C: Send + Sync, TxApi: PoolChainApi> where
-	C: ProvideRuntimeApi + HeaderBackend<Block>,
-{
-	client: Arc<C>,
+pub struct Proposer<Client, TxPool, Backend> {
+	client: Arc<Client>,
 	parent_hash: Hash,
 	parent_id: BlockId,
 	parent_number: BlockNumber,
 	tracker: Arc<AttestationTracker>,
-	transaction_pool: Arc<Pool<TxApi>>,
+	transaction_pool: Arc<TxPool>,
 	slot_duration: u64,
+	backend: Arc<Backend>,
 }
 
-impl<C, TxApi> consensus::Proposer<Block> for Proposer<C, TxApi> where
-	TxApi: PoolChainApi<Block=Block>,
-	C: ProvideRuntimeApi + HeaderBackend<Block> + Send + Sync,
-	C::Api: ParachainHost<Block> + BlockBuilderApi<Block>,
+impl<Client, TxPool, Backend> consensus::Proposer<Block> for Proposer<Client, TxPool, Backend> where
+	TxPool: TransactionPool<Block=Block> + 'static,
+	Client: ProvideRuntimeApi<Block> + HeaderBackend<Block> + Send + Sync + 'static,
+	Client::Api: ParachainHost<Block> + BlockBuilderApi<Block> + ApiExt<Block, Error = sp_blockchain::Error>,
+	Backend: sc_client_api::Backend<Block, State = sp_api::StateBackendFor<Client, Block>> + 'static,
+	// Rust bug: https://github.com/rust-lang/rust/issues/24159
+	sp_api::StateBackendFor<Client, Block>: sp_api::StateBackend<HasherFor<Block>> + Send,
 {
 	type Error = Error;
-	type Create = Either<CreateProposal<C, TxApi>, future::Ready<Result<Block, Error>>>;
+	type Transaction = sp_api::TransactionFor<Client, Block>;
+	type Proposal = Pin<
+		Box<
+			dyn Future<Output = Result<Proposal<Block, sp_api::TransactionFor<Client, Block>>, Error>>
+				+ Send
+		>
+	>;
 
 	fn propose(&mut self,
 		inherent_data: InherentData,
 		inherent_digests: DigestFor<Block>,
 		max_duration: Duration,
-	) -> Self::Create {
-		const ATTEMPT_PROPOSE_EVERY: Duration = Duration::from_millis(100);
+		record_proof: RecordProof,
+	) -> Self::Proposal {
 		const SLOT_DURATION_DENOMINATOR: u64 = 3; // wait up to 1/3 of the slot for candidates.
 
 		let initial_included = self.tracker.table.includable_count();
@@ -567,54 +647,62 @@ impl<C, TxApi> consensus::Proposer<Block> for Proposer<C, TxApi> where
 			Duration::from_millis(self.slot_duration / SLOT_DURATION_DENOMINATOR),
 		);
 
-		let enough_candidates = dynamic_inclusion.acceptable_in(
-			now,
-			initial_included,
-		).unwrap_or_else(|| Duration::from_millis(1));
+		let parent_hash = self.parent_hash.clone();
+		let parent_number = self.parent_number.clone();
+		let parent_id = self.parent_id.clone();
+		let client = self.client.clone();
+		let transaction_pool = self.transaction_pool.clone();
+		let table = self.tracker.table.clone();
+		let backend = self.backend.clone();
 
-		let believed_timestamp = match inherent_data.timestamp_inherent_data() {
-			Ok(timestamp) => timestamp,
-			Err(e) => return Either::Right(future::err(Error::InherentError(e))),
-		};
+		async move {
+			let enough_candidates = dynamic_inclusion.acceptable_in(
+				now,
+				initial_included,
+			).unwrap_or_else(|| Duration::from_millis(1));
 
-		// set up delay until next allowed timestamp.
-		let current_timestamp = current_timestamp();
-		let delay_future = if current_timestamp >= believed_timestamp {
-			None
-		} else {
-			Some(Delay::new(Duration::from_millis (current_timestamp - believed_timestamp)))
-		};
+			let believed_timestamp = match inherent_data.timestamp_inherent_data() {
+				Ok(timestamp) => timestamp,
+				Err(e) => return Err(Error::InherentError(e)),
+			};
 
-		let timing = ProposalTiming {
-			minimum: delay_future,
-			attempt_propose: Interval::new(ATTEMPT_PROPOSE_EVERY),
-			enough_candidates: Delay::new(enough_candidates),
-			dynamic_inclusion,
-			last_included: initial_included,
-		};
+			let deadline_diff = max_duration - max_duration / 3;
+			let deadline = match Instant::now().checked_add(deadline_diff) {
+				None => return Err(Error::DeadlineComputeFailure(deadline_diff)),
+				Some(d) => d,
+			};
 
-		let deadline_diff = max_duration - max_duration / 3;
-		let deadline = match Instant::now().checked_add(deadline_diff) {
-			None => return Either::Right(
-				future::err(Error::DeadlineComputeFailure(deadline_diff)),
-			),
-			Some(d) => d,
-		};
+			let data = CreateProposalData {
+				parent_hash,
+				parent_number,
+				parent_id,
+				client,
+				transaction_pool,
+				table,
+				believed_minimum_timestamp: believed_timestamp,
+				inherent_data: Some(inherent_data),
+				inherent_digests,
+				// leave some time for the proposal finalisation
+				deadline,
+				record_proof,
+				backend,
+			};
 
-		Either::Left(CreateProposal {
-			parent_hash: self.parent_hash.clone(),
-			parent_number: self.parent_number.clone(),
-			parent_id: self.parent_id.clone(),
-			client: self.client.clone(),
-			transaction_pool: self.transaction_pool.clone(),
-			table: self.tracker.table.clone(),
-			believed_minimum_timestamp: believed_timestamp,
-			timing,
-			inherent_data: Some(inherent_data),
-			inherent_digests,
-			// leave some time for the proposal finalisation
-			deadline,
-		})
+			// set up delay until next allowed timestamp.
+			let current_timestamp = current_timestamp();
+			if current_timestamp < believed_timestamp {
+				Delay::new(Duration::from_millis(current_timestamp - believed_timestamp))
+					.await;
+			}
+
+			Delay::new(enough_candidates).await;
+
+			tokio_executor::blocking::run(move || {
+				let proposed_candidates = data.table.proposed_set();
+				data.propose_with(proposed_candidates)
+			})
+				.await
+		}.boxed()
 	}
 }
 
@@ -624,74 +712,34 @@ fn current_timestamp() -> u64 {
 		.as_millis() as u64
 }
 
-struct ProposalTiming {
-	minimum: Option<Delay>,
-	attempt_propose: Interval,
-	dynamic_inclusion: DynamicInclusion,
-	enough_candidates: Delay,
-	last_included: usize,
-}
-
-impl ProposalTiming {
-	// whether it's time to attempt a proposal.
-	// shouldn't be called outside of the context of a task.
-	fn poll(&mut self, cx: &mut Context, included: usize) -> futures03::Poll<Result<(), Error>> {
-		// first drain from the interval so when the minimum delay is up
-		// we don't have any notifications built up.
-		//
-		// this interval is just meant to produce periodic task wakeups
-		// that lead to the `dynamic_inclusion` getting updated as necessary.
-		while let futures03::Poll::Ready(x) = self.attempt_propose.poll_next_unpin(cx) {
-			x.expect("timer still alive; intervals never end; qed");
-		}
-
-		// wait until the minimum time has passed.
-		if let Some(mut minimum) = self.minimum.take() {
-			if let futures03::Poll::Pending = minimum.poll_unpin(cx) {
-				self.minimum = Some(minimum);
-				return futures03::Poll::Pending;
-			}
-		}
-
-		if included == self.last_included {
-			return self.enough_candidates.poll_unpin(cx).map_err(Error::Timer);
-		}
-
-		// the amount of includable candidates has changed. schedule a wakeup
-		// if it's not sufficient anymore.
-		match self.dynamic_inclusion.acceptable_in(Instant::now(), included) {
-			Some(instant) => {
-				self.last_included = included;
-				self.enough_candidates.reset(instant);
-				self.enough_candidates.poll_unpin(cx).map_err(Error::Timer)
-			}
-			None => futures03::Poll::Ready(Ok(())),
-		}
-	}
-}
-
-/// Future which resolves upon the creation of a proposal.
-pub struct CreateProposal<C: Send + Sync, TxApi: PoolChainApi> {
+/// Inner data of the create proposal.
+struct CreateProposalData<Client, TxPool, Backend> {
 	parent_hash: Hash,
 	parent_number: BlockNumber,
 	parent_id: BlockId,
-	client: Arc<C>,
-	transaction_pool: Arc<Pool<TxApi>>,
+	client: Arc<Client>,
+	transaction_pool: Arc<TxPool>,
 	table: Arc<SharedTable>,
-	timing: ProposalTiming,
 	believed_minimum_timestamp: u64,
 	inherent_data: Option<InherentData>,
 	inherent_digests: DigestFor<Block>,
 	deadline: Instant,
+	record_proof: RecordProof,
+	backend: Arc<Backend>,
 }
 
-impl<C, TxApi> CreateProposal<C, TxApi> where
-	TxApi: PoolChainApi<Block=Block>,
-	C: ProvideRuntimeApi + HeaderBackend<Block> + Send + Sync,
-	C::Api: ParachainHost<Block> + BlockBuilderApi<Block>,
+impl<Client, TxPool, Backend> CreateProposalData<Client, TxPool, Backend> where
+	TxPool: TransactionPool<Block=Block>,
+	Client: ProvideRuntimeApi<Block> + HeaderBackend<Block> + Send + Sync,
+	Client::Api: ParachainHost<Block> + BlockBuilderApi<Block> + ApiExt<Block, Error = sp_blockchain::Error>,
+	Backend: sc_client_api::Backend<Block, State = sp_api::StateBackendFor<Client, Block>> + 'static,
+	// Rust bug: https://github.com/rust-lang/rust/issues/24159
+	sp_api::StateBackendFor<Client, Block>: sp_api::StateBackend<HasherFor<Block>> + Send,
 {
-	fn propose_with(&mut self, candidates: Vec<AttestedCandidate>) -> Result<Block, Error> {
-		use client::block_builder::BlockBuilder;
+	fn propose_with(
+		mut self,
+		candidates: Vec<AttestedCandidate>,
+	) -> Result<Proposal<Block, sp_api::TransactionFor<Client, Block>>, Error> {
 		use runtime_primitives::traits::{Hash as HashT, BlakeTwo256};
 
 		const MAX_TRANSACTIONS: usize = 40;
@@ -699,11 +747,19 @@ impl<C, TxApi> CreateProposal<C, TxApi> where
 		let mut inherent_data = self.inherent_data
 			.take()
 			.expect("CreateProposal is not polled after finishing; qed");
-		inherent_data.put_data(polkadot_runtime::NEW_HEADS_IDENTIFIER, &candidates).map_err(Error::InherentError)?;
+		inherent_data.put_data(NEW_HEADS_IDENTIFIER, &candidates)
+			.map_err(Error::InherentError)?;
 
 		let runtime_api = self.client.runtime_api();
 
-		let mut block_builder = BlockBuilder::at_block(&self.parent_id, &*self.client, false, self.inherent_digests.clone())?;
+		let mut block_builder = block_builder::BlockBuilder::new(
+			&*self.client,
+			self.client.expect_block_hash_from_id(&self.parent_id)?,
+			self.client.expect_block_number_from_id(&self.parent_id)?,
+			self.record_proof,
+			self.inherent_digests.clone(),
+			&*self.backend,
+		)?;
 
 		{
 			let inherents = runtime_api.inherent_extrinsics(&self.parent_id, inherent_data)?;
@@ -716,7 +772,7 @@ impl<C, TxApi> CreateProposal<C, TxApi> where
 
 			let ready_iter = self.transaction_pool.ready();
 			for ready in ready_iter.take(MAX_TRANSACTIONS) {
-				let encoded_size = ready.data.encode().len();
+				let encoded_size = ready.data().encode().len();
 				if pending_size + encoded_size >= MAX_TRANSACTIONS_SIZE {
 					break;
 				}
@@ -725,18 +781,20 @@ impl<C, TxApi> CreateProposal<C, TxApi> where
 					break;
 				}
 
-				match block_builder.push(ready.data.clone()) {
+				match block_builder.push(ready.data().clone()) {
 					Ok(()) => {
-						debug!("[{:?}] Pushed to the block.", ready.hash);
+						debug!("[{:?}] Pushed to the block.", ready.hash());
 						pending_size += encoded_size;
 					}
-					Err(client_error::Error::ApplyExtrinsicFailed(e)) if e.exhausted_resources() => {
+					Err(sp_blockchain::Error::ApplyExtrinsicFailed(sp_blockchain::ApplyExtrinsicFailed::Validity(e)))
+						if e.exhausted_resources() =>
+					{
 						debug!("Block is full, proceed with proposing.");
 						break;
 					}
 					Err(e) => {
 						trace!(target: "transaction-pool", "Invalid transaction: {}", e);
-						unqueue_invalid.push(ready.hash.clone());
+						unqueue_invalid.push(ready.hash().clone());
 					}
 				}
 			}
@@ -744,7 +802,7 @@ impl<C, TxApi> CreateProposal<C, TxApi> where
 			self.transaction_pool.remove_invalid(&unqueue_invalid);
 		}
 
-		let new_block = block_builder.bake()?;
+		let (new_block, storage_changes, proof) = block_builder.build()?.into_inner();
 
 		info!("Prepared block for proposing at {} [hash: {:?}; parent_hash: {}; extrinsics: [{}]]",
 			new_block.header.number,
@@ -766,34 +824,14 @@ impl<C, TxApi> CreateProposal<C, TxApi> where
 			&active_parachains[..],
 		).is_ok());
 
-		Ok(new_block)
-	}
-}
-
-impl<C, TxApi> futures03::Future for CreateProposal<C, TxApi> where
-	TxApi: PoolChainApi<Block=Block>,
-	C: ProvideRuntimeApi + HeaderBackend<Block> + Send + Sync,
-	C::Api: ParachainHost<Block> + BlockBuilderApi<Block>,
-{
-	type Output = Result<Block, Error>;
-
-	fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> futures03::Poll<Self::Output> {
-		// 1. try to propose if we have enough includable candidates and other
-		// delays have concluded.
-		let included = self.table.includable_count();
-		futures03::ready!(self.timing.poll(cx, included))?;
-
-		// 2. propose
-		let proposed_candidates = self.table.proposed_set();
-
-		futures03::Poll::Ready(self.propose_with(proposed_candidates))
+		Ok(Proposal { block: new_block, storage_changes, proof })
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use substrate_keyring::Sr25519Keyring;
+	use sp_keyring::Sr25519Keyring;
 
 	#[test]
 	fn sign_and_check_statement() {

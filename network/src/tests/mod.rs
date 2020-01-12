@@ -1,4 +1,4 @@
-// Copyright 2018 Parity Technologies (UK) Ltd.
+// Copyright 2018-2020 Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -24,16 +24,15 @@ use polkadot_validation::GenericStatement;
 use polkadot_primitives::{Block, Hash};
 use polkadot_primitives::parachain::{
 	CandidateReceipt, HeadData, PoVBlock, BlockData, CollatorId, ValidatorId,
-	StructuredUnroutedIngress
+	StructuredUnroutedIngress,
 };
-use substrate_primitives::crypto::UncheckedInto;
+use sp_core::crypto::UncheckedInto;
 use codec::Encode;
-use substrate_network::{
-	PeerId, Context, config::Roles, message::generic::ConsensusMessage,
-	specialization::NetworkSpecialization,
+use sc_network::{
+	PeerId, Context, ReputationChange, config::Roles, specialization::NetworkSpecialization,
 };
 
-use futures::Future;
+use futures::executor::block_on;
 
 mod validation;
 
@@ -46,19 +45,15 @@ struct TestContext {
 }
 
 impl Context<Block> for TestContext {
-	fn report_peer(&mut self, peer: PeerId, reputation: i32) {
-        let reputation = self.reputations.get(&peer).map_or(reputation, |v| v + reputation);
-        self.reputations.insert(peer.clone(), reputation);
+	fn report_peer(&mut self, peer: PeerId, reputation: ReputationChange) {
+		let reputation = self.reputations.get(&peer).map_or(reputation.value, |v| v + reputation.value);
+		self.reputations.insert(peer.clone(), reputation);
 
 		match reputation {
 			i if i < -100 => self.disabled.push(peer),
 			i if i < 0 => self.disconnected.push(peer),
 			_ => {}
 		}
-	}
-
-	fn send_consensus(&mut self, _who: PeerId, _consensus: ConsensusMessage) {
-		unimplemented!()
 	}
 
 	fn send_chain_specific(&mut self, who: PeerId, message: Vec<u8>) {
@@ -89,7 +84,7 @@ impl crate::gossip::ChainContext for TestChainContext {
 	}
 
 	fn leaf_unrouted_roots(&self, leaf: &Hash, with_queue_root: &mut dyn FnMut(&Hash))
-		-> Result<(), substrate_client::error::Error>
+		-> Result<(), sp_blockchain::Error>
 	{
 		for root in self.ingress_roots.get(leaf).into_iter().flat_map(|roots| roots) {
 			with_queue_root(root)
@@ -183,6 +178,7 @@ fn fetches_from_those_with_knowledge() {
 		fees: 1_000_000,
 		block_data_hash,
 		upward_messages: Vec::new(),
+		erasure_root: [1u8; 32].into(),
 	};
 
 	let candidate_hash = candidate_receipt.hash();
@@ -244,57 +240,7 @@ fn fetches_from_those_with_knowledge() {
 		let pov_block = make_pov(block_data.0);
 		on_message(&mut protocol, &mut ctx, peer_b, Message::PovBlock(2, Some(pov_block.clone())));
 		drop(protocol);
-		assert_eq!(recv.wait().unwrap(), pov_block);
-	}
-}
-
-#[test]
-fn fetches_available_block_data() {
-	let mut protocol = PolkadotProtocol::new(None);
-
-	let peer_a = PeerId::random();
-	let parent_hash = [0; 32].into();
-
-	let block_data = BlockData(vec![1, 2, 3, 4]);
-	let block_data_hash = block_data.hash();
-	let para_id = 5.into();
-	let candidate_receipt = CandidateReceipt {
-		parachain_index: para_id,
-		collator: [255; 32].unchecked_into(),
-		head_data: HeadData(vec![9, 9, 9]),
-		signature: Default::default(),
-		egress_queue_roots: Vec::new(),
-		fees: 1_000_000,
-		block_data_hash,
-		upward_messages: Vec::new(),
-	};
-
-	let candidate_hash = candidate_receipt.hash();
-	let av_store = ::av_store::Store::new_in_memory();
-
-	let status = Status { collating_for: None };
-
-	protocol.register_availability_store(av_store.clone());
-
-	av_store.make_available(::av_store::Data {
-		relay_parent: parent_hash,
-		parachain_id: para_id,
-		candidate_hash,
-		block_data: block_data.clone(),
-		outgoing_queues: None,
-	}).unwrap();
-
-	// connect peer A
-	{
-		let mut ctx = TestContext::default();
-		protocol.on_connect(&mut ctx, peer_a.clone(), make_status(&status, Roles::FULL));
-	}
-
-	// peer A asks for historic block data and gets response
-	{
-		let mut ctx = TestContext::default();
-		on_message(&mut protocol, &mut ctx, peer_a.clone(), Message::RequestBlockData(1, parent_hash, candidate_hash));
-		assert!(ctx.has_message(peer_a, Message::BlockData(1, Some(block_data))));
+		assert_eq!(block_on(recv).unwrap(), pov_block);
 	}
 }
 

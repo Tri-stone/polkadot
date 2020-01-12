@@ -1,4 +1,4 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
+// Copyright 2019-2020 Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -21,31 +21,57 @@
 use std::sync::Arc;
 
 use polkadot_primitives::{Block, AccountId, Nonce, Balance};
-use sr_primitives::traits::ProvideRuntimeApi;
-use transaction_pool::txpool::{ChainApi, Pool};
-use polkadot_runtime::UncheckedExtrinsic;
+use sp_api::ProvideRuntimeApi;
+use txpool_api::TransactionPool;
 
 /// A type representing all RPC extensions.
-pub type RpcExtension = jsonrpc_core::IoHandler<substrate_rpc::Metadata>;
+pub type RpcExtension = jsonrpc_core::IoHandler<sc_rpc::Metadata>;
 
 /// Instantiate all RPC extensions.
-pub fn create<C, P>(client: Arc<C>, pool: Arc<Pool<P>>) -> RpcExtension where
-	C: ProvideRuntimeApi,
+pub fn create_full<C, P, UE>(client: Arc<C>, pool: Arc<P>) -> RpcExtension where
+	C: ProvideRuntimeApi<Block>,
 	C: client::blockchain::HeaderBackend<Block>,
 	C: Send + Sync + 'static,
-	C::Api: srml_system_rpc::AccountNonceApi<Block, AccountId, Nonce>,
-	C::Api: srml_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance, UncheckedExtrinsic>,
-	P: ChainApi + Sync + Send + 'static,
+	C::Api: frame_rpc_system::AccountNonceApi<Block, AccountId, Nonce>,
+	C::Api: pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance, UE>,
+	P: TransactionPool + Sync + Send + 'static,
+	UE: codec::Codec + Send + Sync + 'static,
 {
-	use srml_system_rpc::{System, SystemApi};
-	use srml_transaction_payment_rpc::{TransactionPayment, TransactionPaymentApi};
+	use frame_rpc_system::{FullSystem, SystemApi};
+	use pallet_transaction_payment_rpc::{TransactionPayment, TransactionPaymentApi};
 
 	let mut io = jsonrpc_core::IoHandler::default();
 	io.extend_with(
-		SystemApi::to_delegate(System::new(client.clone(), pool))
+		SystemApi::to_delegate(FullSystem::new(client.clone(), pool))
 	);
 	io.extend_with(
 		TransactionPaymentApi::to_delegate(TransactionPayment::new(client))
+	);
+	io
+}
+
+/// Instantiate all RPC extensions for light node.
+pub fn create_light<C, P, F, UE>(
+	client: Arc<C>,
+	remote_blockchain: Arc<dyn client::light::blockchain::RemoteBlockchain<Block>>,
+	fetcher: Arc<F>,
+	pool: Arc<P>,
+) -> RpcExtension
+	where
+		C: ProvideRuntimeApi<Block>,
+		C: client::blockchain::HeaderBackend<Block>,
+		C: Send + Sync + 'static,
+		C::Api: frame_rpc_system::AccountNonceApi<Block, AccountId, Nonce>,
+		C::Api: pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance, UE>,
+		P: TransactionPool + Sync + Send + 'static,
+		F: client::light::fetcher::Fetcher<Block> + 'static,
+		UE: codec::Codec + Send + Sync + 'static,
+{
+	use frame_rpc_system::{LightSystem, SystemApi};
+
+	let mut io = jsonrpc_core::IoHandler::default();
+	io.extend_with(
+		SystemApi::<AccountId, Nonce>::to_delegate(LightSystem::new(client, remote_blockchain, fetcher, pool))
 	);
 	io
 }

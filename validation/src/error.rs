@@ -1,4 +1,4 @@
-// Copyright 2017 Parity Technologies (UK) Ltd.
+// Copyright 2017-2020 Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -16,14 +16,13 @@
 
 //! Errors that can occur during the validation process.
 
-use runtime_primitives::RuntimeString;
 use polkadot_primitives::parachain::ValidatorId;
 
 /// Error type for validation
 #[derive(Debug, derive_more::Display, derive_more::From)]
 pub enum Error {
 	/// Client error
-	Client(client::error::Error),
+	Client(sp_blockchain::Error),
 	/// Consensus error
 	Consensus(consensus::error::Error),
 	#[display(fmt = "Invalid duty roster length: expected {}, got {}", expected, got)]
@@ -38,7 +37,7 @@ pub enum Error {
 	NotValidator(ValidatorId),
 	/// Unexpected error checking inherents
 	#[display(fmt = "Unexpected error while checking inherents: {}", _0)]
-	InherentError(RuntimeString),
+	InherentError(inherents::Error),
 	/// Proposer destroyed before finishing proposing or evaluating
 	#[display(fmt = "Proposer destroyed before finishing proposing or evaluating")]
 	PrematureDestruction,
@@ -47,9 +46,7 @@ pub enum Error {
 	Timer(std::io::Error),
 	#[display(fmt = "Failed to compute deadline of now + {:?}", _0)]
 	DeadlineComputeFailure(std::time::Duration),
-	/// Unable to dispatch agreement future
-	#[display(fmt = "Unable to dispatch agreement future: {:?}", _0)]
-	Executor(futures::future::ExecuteErrorKind),
+	Join(tokio::task::JoinError)
 }
 
 impl std::error::Error for Error {

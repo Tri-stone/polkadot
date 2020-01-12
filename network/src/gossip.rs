@@ -1,4 +1,4 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
+// Copyright 2019-2020 Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -49,27 +49,32 @@
 //! Peers who send information which was not allowed under a recent neighbor packet
 //! will be noted as non-beneficial to Substrate's peer-set management utility.
 
-use sr_primitives::{generic::BlockId, traits::ProvideRuntimeApi};
-use substrate_client::error::Error as ClientError;
-use substrate_network::{config::Roles, PeerId};
-use substrate_network::consensus_gossip::{
-	self as network_gossip, ValidationResult as GossipValidationResult,
-	ValidatorContext, MessageIntent, ConsensusMessage,
+use sp_runtime::{generic::BlockId, traits::{BlakeTwo256, Hash as HashT}};
+use sp_blockchain::Error as ClientError;
+use sc_network::{config::Roles, Context, PeerId, ReputationChange};
+use sc_network_gossip::{
+	ValidationResult as GossipValidationResult,
+	ValidatorContext, MessageIntent,
 };
-use polkadot_validation::SignedStatement;
+use polkadot_validation::{SignedStatement};
 use polkadot_primitives::{Block, Hash};
-use polkadot_primitives::parachain::{ParachainHost, ValidatorId, Message as ParachainMessage};
+use polkadot_primitives::parachain::{
+	ParachainHost, ValidatorId, Message as ParachainMessage, ErasureChunk as PrimitiveChunk
+};
+use polkadot_erasure_coding::{self as erasure};
 use codec::{Decode, Encode};
+use sp_api::ProvideRuntimeApi;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrayvec::ArrayVec;
+use futures::prelude::*;
 use parking_lot::RwLock;
 use log::warn;
 
 use super::PolkadotNetworkService;
-use crate::router::attestation_topic;
+use crate::{GossipMessageStream, NetworkService, PolkadotProtocol, router::attestation_topic};
 
 use attestation::{View as AttestationView, PeerData as AttestationPeerData};
 use message_routing::{View as MessageRoutingView};
@@ -78,7 +83,7 @@ mod attestation;
 mod message_routing;
 
 /// The engine ID of the polkadot attestation system.
-pub const POLKADOT_ENGINE_ID: sr_primitives::ConsensusEngineId = *b"dot1";
+pub const POLKADOT_ENGINE_ID: sp_runtime::ConsensusEngineId = *b"dot1";
 
 // arbitrary; in practice this should not be more than 2.
 pub(crate) const MAX_CHAIN_HEADS: usize = 5;
@@ -87,40 +92,50 @@ pub(crate) const MAX_CHAIN_HEADS: usize = 5;
 pub type LeavesVec = ArrayVec<[Hash; MAX_CHAIN_HEADS]>;
 
 mod benefit {
+	use sc_network::ReputationChange as Rep;
 	/// When a peer sends us a previously-unknown candidate statement.
-	pub const NEW_CANDIDATE: i32 = 100;
+	pub const NEW_CANDIDATE: Rep = Rep::new(100, "Polkadot: New candidate");
 	/// When a peer sends us a previously-unknown attestation.
-	pub const NEW_ATTESTATION: i32 = 50;
+	pub const NEW_ATTESTATION: Rep = Rep::new(50, "Polkadot: New attestation");
+	/// When a peer sends us a previously-unknown erasure chunk.
+	pub const NEW_ERASURE_CHUNK: Rep = Rep::new(10, "Polkadot: New erasure chunk");
 	/// When a peer sends us a previously-unknown message packet.
-	pub const NEW_ICMP_MESSAGES: i32 = 50;
+	pub const NEW_ICMP_MESSAGES: Rep = Rep::new(50, "Polkadot: New ICMP messages");
 }
 
 mod cost {
+	use sc_network::ReputationChange as Rep;
+	/// No cost. This will not be reported.
+	pub const NONE: Rep = Rep::new(0, "");
 	/// A peer sent us an attestation and we don't know the candidate.
-	pub const ATTESTATION_NO_CANDIDATE: i32 = -100;
+	pub const ATTESTATION_NO_CANDIDATE: Rep = Rep::new(-100, "Polkadot: No candidate");
 	/// A peer sent us a statement we consider in the future.
-	pub const FUTURE_MESSAGE: i32 = -100;
+	pub const FUTURE_MESSAGE: Rep = Rep::new(-100, "Polkadot: Future message");
 	/// A peer sent us a statement from the past.
-	pub const PAST_MESSAGE: i32 = -30;
+	pub const PAST_MESSAGE: Rep = Rep::new(-30, "Polkadot: Past message");
 	/// A peer sent us a malformed message.
-	pub const MALFORMED_MESSAGE: i32 = -500;
+	pub const MALFORMED_MESSAGE: Rep = Rep::new(-500, "Polkadot: Malformed message");
 	/// A peer sent us a wrongly signed message.
-	pub const BAD_SIGNATURE: i32 = -500;
+	pub const BAD_SIGNATURE: Rep = Rep::new(-500, "Polkadot: Bad signature");
 	/// A peer sent us a bad neighbor packet.
-	pub const BAD_NEIGHBOR_PACKET: i32 = -300;
+	pub const BAD_NEIGHBOR_PACKET: Rep = Rep::new(-300, "Polkadot: Bad neighbor");
 	/// A peer sent us an ICMP queue we haven't advertised a need for.
-	pub const UNNEEDED_ICMP_MESSAGES: i32 = -100;
+	pub const UNNEEDED_ICMP_MESSAGES: Rep = Rep::new(-100, "Polkadot: Unexpected ICMP message");
+	/// A peer sent us an erasure chunk referring to a candidate that we are not aware of.
+	pub const ORPHANED_ERASURE_CHUNK: Rep = Rep::new(-10, "An erasure chunk from unknown candidate");
+	/// A peer sent us an erasure chunk that does not match candidate's erasure root.
+	pub const ERASURE_CHUNK_WRONG_ROOT: Rep = Rep::new(-100, "Chunk doesn't match encoding root");
 
 	/// A peer sent us an ICMP queue with a bad root.
-	pub fn icmp_messages_root_mismatch(n_messages: usize) -> i32 {
+	pub fn icmp_messages_root_mismatch(n_messages: usize) -> Rep {
 		const PER_MESSAGE: i32 = -150;
 
-		(0..n_messages).map(|_| PER_MESSAGE).sum()
+		Rep::new((0..n_messages).map(|_| PER_MESSAGE).sum(), "Polkadot: ICMP root mismatch")
 	}
 }
 
 /// A gossip message.
-#[derive(Encode, Decode, Clone)]
+#[derive(Encode, Decode, Clone, PartialEq)]
 pub enum GossipMessage {
 	/// A packet sent to a neighbor but not relayed.
 	#[codec(index = "1")]
@@ -133,16 +148,9 @@ pub enum GossipMessage {
 	#[codec(index = "3")]
 	ParachainMessages(GossipParachainMessages),
 	// TODO: https://github.com/paritytech/polkadot/issues/253
-	// erasure-coded chunks.
-}
-
-impl GossipMessage {
-	fn to_consensus_message(&self) -> ConsensusMessage {
-		ConsensusMessage {
-			data: self.encode(),
-			engine_id: POLKADOT_ENGINE_ID,
-		}
-	}
+	/// A packet containing one of the erasure-coding chunks of one candidate.
+	#[codec(index = "4")]
+	ErasureChunk(ErasureChunkMessage),
 }
 
 impl From<NeighborPacket> for GossipMessage {
@@ -164,7 +172,7 @@ impl From<GossipParachainMessages> for GossipMessage {
 }
 
 /// A gossip message containing a statement.
-#[derive(Encode, Decode, Clone)]
+#[derive(Encode, Decode, Clone, PartialEq)]
 pub struct GossipStatement {
 	/// The block hash of the relay chain being referred to. In context, this should
 	/// be a leaf.
@@ -183,12 +191,30 @@ impl GossipStatement {
 	}
 }
 
+/// A gossip message containing one erasure chunk of a candidate block.
+/// For each chunk of block erasure encoding one of this messages is constructed.
+#[derive(Encode, Decode, Clone, Debug, PartialEq)]
+pub struct ErasureChunkMessage {
+	/// The chunk itself.
+	pub chunk: PrimitiveChunk,
+	/// The relay parent of the block this chunk belongs to.
+	pub relay_parent: Hash,
+	/// The hash of the candidate receipt of the block this chunk belongs to.
+	pub candidate_hash: Hash,
+}
+
+impl From<ErasureChunkMessage> for GossipMessage {
+	fn from(chk: ErasureChunkMessage) -> Self {
+		GossipMessage::ErasureChunk(chk)
+	}
+}
+
 /// A packet of messages from one parachain to another.
 ///
 /// These are all the messages posted from one parachain to another during the
 /// execution of a single parachain block. Since this parachain block may have been
 /// included in many forks of the relay chain, there is no relay-chain leaf parameter.
-#[derive(Encode, Decode, Clone)]
+#[derive(Encode, Decode, Clone, PartialEq)]
 pub struct GossipParachainMessages {
 	/// The root of the message queue.
 	pub queue_root: Hash,
@@ -208,7 +234,7 @@ impl GossipParachainMessages {
 }
 
 /// A versioned neighbor message.
-#[derive(Encode, Decode, Clone)]
+#[derive(Encode, Decode, Clone, PartialEq)]
 pub enum VersionedNeighborPacket {
 	#[codec(index = "1")]
 	V1(NeighborPacket),
@@ -216,13 +242,13 @@ pub enum VersionedNeighborPacket {
 
 /// Contains information on which chain heads the peer is
 /// accepting messages for.
-#[derive(Encode, Decode, Clone)]
+#[derive(Encode, Decode, Clone, PartialEq)]
 pub struct NeighborPacket {
 	chain_heads: Vec<Hash>,
 }
 
 /// whether a block is known.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum Known {
 	/// The block is a known leaf.
 	Leaf,
@@ -248,8 +274,8 @@ pub trait ChainContext: Send + Sync {
 impl<F, P> ChainContext for (F, P) where
 	F: Fn(&Hash) -> Option<Known> + Send + Sync,
 	P: Send + Sync + std::ops::Deref,
-	P::Target: ProvideRuntimeApi,
-	<P::Target as ProvideRuntimeApi>::Api: ParachainHost<Block>,
+	P::Target: ProvideRuntimeApi<Block>,
+	<P::Target as ProvideRuntimeApi<Block>>::Api: ParachainHost<Block, Error = ClientError>,
 {
 	fn is_known(&self, block_hash: &Hash) -> Option<Known> {
 		(self.0)(block_hash)
@@ -285,11 +311,14 @@ impl<F, P> ChainContext for (F, P) where
 pub fn register_validator<C: ChainContext + 'static>(
 	service: Arc<PolkadotNetworkService>,
 	chain: C,
+	executor: &impl futures::task::Spawn,
 ) -> RegisteredMessageValidator
 {
 	let s = service.clone();
-	let report_handle = Box::new(move |peer: &PeerId, cost_benefit| {
-		s.report_peer(peer.clone(), cost_benefit);
+	let report_handle = Box::new(move |peer: &PeerId, cost_benefit: ReputationChange| {
+		if cost_benefit.value != 0 {
+			s.report_peer(peer.clone(), cost_benefit);
+		}
 	});
 	let validator = Arc::new(MessageValidator {
 		report_handle,
@@ -297,24 +326,32 @@ pub fn register_validator<C: ChainContext + 'static>(
 			peers: HashMap::new(),
 			attestation_view: Default::default(),
 			message_routing_view: Default::default(),
+			availability_store: None,
 			chain,
 		})
 	});
 
 	let gossip_side = validator.clone();
-	service.with_gossip(|gossip, ctx|
-		gossip.register_validator(ctx, POLKADOT_ENGINE_ID, gossip_side)
+	let gossip_engine = sc_network_gossip::GossipEngine::new(
+		service.clone(),
+		executor,
+		POLKADOT_ENGINE_ID,
+		gossip_side,
 	);
 
-	RegisteredMessageValidator { inner: validator as _ }
+	RegisteredMessageValidator {
+		inner: validator as _,
+		service: Some(service),
+		gossip_engine: Some(gossip_engine),
+	}
 }
 
 #[derive(PartialEq)]
 enum NewLeafAction {
 	// (who, message)
-	TargetedMessage(PeerId, ConsensusMessage),
+	TargetedMessage(PeerId, GossipMessage),
 	// (topic, message)
-	Multicast(Hash, ConsensusMessage),
+	Multicast(Hash, GossipMessage),
 }
 
 /// Actions to take after noting a new block-DAG leaf.
@@ -329,15 +366,14 @@ impl NewLeafActions {
 	/// Perform the queued actions, feeding into gossip.
 	pub fn perform(
 		self,
-		gossip: &mut dyn crate::GossipService,
-		ctx: &mut dyn substrate_network::Context<Block>,
+		gossip: &dyn crate::NetworkService,
 	) {
 		for action in self.actions {
 			match action {
 				NewLeafAction::TargetedMessage(who, message)
-					=> gossip.send_message(ctx, &who, message),
+					=> gossip.send_message(who, message),
 				NewLeafAction::Multicast(topic, message)
-					=> gossip.multicast(ctx, &topic, message),
+					=> gossip.gossip_message(topic, message),
 			}
 		}
 	}
@@ -349,17 +385,29 @@ impl NewLeafActions {
 #[derive(Clone)]
 pub struct RegisteredMessageValidator {
 	inner: Arc<MessageValidator<dyn ChainContext>>,
+	// Note: this is always `Some` in real code and `None` in tests.
+	service: Option<Arc<PolkadotNetworkService>>,
+	// Note: this is always `Some` in real code and `None` in tests.
+	gossip_engine: Option<sc_network_gossip::GossipEngine<Block>>,
 }
 
 impl RegisteredMessageValidator {
 	#[cfg(test)]
 	pub(crate) fn new_test<C: ChainContext + 'static>(
 		chain: C,
-		report_handle: Box<dyn Fn(&PeerId, i32) + Send + Sync>,
+		report_handle: Box<dyn Fn(&PeerId, ReputationChange) + Send + Sync>,
 	) -> Self {
 		let validator = Arc::new(MessageValidator::new_test(chain, report_handle));
 
-		RegisteredMessageValidator { inner: validator as _ }
+		RegisteredMessageValidator {
+			inner: validator as _,
+			service: None,
+			gossip_engine: None,
+		}
+	}
+
+	pub fn register_availability_store(&mut self, availability_store: av_store::Store) {
+		self.inner.inner.write().availability_store = Some(availability_store);
 	}
 
 	/// Note that we perceive a new leaf of the block-DAG. We will notify our neighbors that
@@ -409,7 +457,7 @@ impl RegisteredMessageValidator {
 					let message = GossipMessage::from(GossipParachainMessages {
 						queue_root: *queue_root,
 						messages,
-					}).to_consensus_message();
+					});
 
 					actions.push(NewLeafAction::Multicast(*topic, message));
 
@@ -420,6 +468,49 @@ impl RegisteredMessageValidator {
 		);
 
 		NewLeafActions { actions }
+	}
+}
+
+impl NetworkService for RegisteredMessageValidator {
+	fn gossip_messages_for(&self, topic: Hash) -> GossipMessageStream {
+		let topic_stream = if let Some(gossip_engine) = self.gossip_engine.as_ref() {
+			gossip_engine.messages_for(topic)
+		} else {
+			log::error!("Called gossip_messages_for on a test engine");
+			futures::channel::mpsc::unbounded().1
+		};
+
+		GossipMessageStream::new(topic_stream.boxed())
+	}
+
+	fn gossip_message(&self, topic: Hash, message: GossipMessage) {
+		if let Some(gossip_engine) = self.gossip_engine.as_ref() {
+			gossip_engine.gossip_message(
+				topic,
+				message.encode(),
+				false,
+			);
+		} else {
+			log::error!("Called gossip_message on a test engine");
+		}
+	}
+
+	fn send_message(&self, who: PeerId, message: GossipMessage) {
+		if let Some(gossip_engine) = self.gossip_engine.as_ref() {
+			gossip_engine.send_message(vec![who], message.encode());
+		} else {
+			log::error!("Called send_message on a test engine");
+		}
+	}
+
+	fn with_spec<F: Send + 'static>(&self, with: F)
+		where F: FnOnce(&mut PolkadotProtocol, &mut dyn Context<Block>)
+	{
+		if let Some(service) = self.service.as_ref() {
+			service.with_spec(with)
+		} else {
+			log::error!("Called with_spec on a test engine");
+		}
 	}
 }
 
@@ -469,12 +560,13 @@ struct Inner<C: ?Sized> {
 	peers: HashMap<PeerId, PeerData>,
 	attestation_view: AttestationView,
 	message_routing_view: MessageRoutingView,
+	availability_store: Option<av_store::Store>,
 	chain: C,
 }
 
 impl<C: ?Sized + ChainContext> Inner<C> {
 	fn validate_neighbor_packet(&mut self, sender: &PeerId, packet: NeighborPacket)
-		-> (GossipValidationResult<Hash>, i32, Vec<Hash>)
+		-> (GossipValidationResult<Hash>, ReputationChange, Vec<Hash>)
 	{
 		let chain_heads = packet.chain_heads;
 		if chain_heads.len() > MAX_CHAIN_HEADS {
@@ -494,17 +586,63 @@ impl<C: ?Sized + ChainContext> Inner<C> {
 				Vec::new()
 			};
 
-			(GossipValidationResult::Discard, 0, new_topics)
+			(GossipValidationResult::Discard, cost::NONE, new_topics)
 		}
 	}
 
-	fn multicast_neighbor_packet<F: FnMut(&PeerId, ConsensusMessage)>(
+	fn validate_erasure_chunk_packet(&mut self, msg: ErasureChunkMessage)
+		-> (GossipValidationResult<Hash>, ReputationChange)
+	{
+		if let Some(store) = &self.availability_store {
+			if let Some(receipt) = store.get_candidate(&msg.candidate_hash) {
+				let chunk_hash = erasure::branch_hash(
+					&receipt.erasure_root,
+					&msg.chunk.proof,
+					msg.chunk.index as usize
+				);
+
+				if chunk_hash != Ok(BlakeTwo256::hash(&msg.chunk.chunk)) {
+					(
+						GossipValidationResult::Discard,
+						cost::ERASURE_CHUNK_WRONG_ROOT
+					)
+				} else {
+					if let Some(awaited_chunks) = store.awaited_chunks() {
+						if awaited_chunks.contains(&(
+								msg.relay_parent,
+								receipt.erasure_root,
+								receipt.hash(),
+								msg.chunk.index,
+							)) {
+							let topic = av_store::erasure_coding_topic(
+								msg.relay_parent,
+								receipt.erasure_root,
+								msg.chunk.index,
+							);
+
+							return (
+								GossipValidationResult::ProcessAndKeep(topic),
+								benefit::NEW_ERASURE_CHUNK,
+							);
+						}
+					}
+					(GossipValidationResult::Discard, cost::NONE)
+				}
+			} else {
+				(GossipValidationResult::Discard, cost::ORPHANED_ERASURE_CHUNK)
+			}
+		} else {
+			(GossipValidationResult::Discard, cost::NONE)
+		}
+	}
+
+	fn multicast_neighbor_packet<F: FnMut(&PeerId, GossipMessage)>(
 		&self,
 		mut send_neighbor_packet: F,
 	) {
 		let neighbor_packet = GossipMessage::from(NeighborPacket {
 			chain_heads: self.attestation_view.neighbor_info().collect(),
-		}).to_consensus_message();
+		});
 
 		for peer in self.peers.keys() {
 			send_neighbor_packet(peer, neighbor_packet.clone())
@@ -514,7 +652,7 @@ impl<C: ?Sized + ChainContext> Inner<C> {
 
 /// An unregistered message validator. Register this with `register_validator`.
 pub struct MessageValidator<C: ?Sized> {
-	report_handle: Box<dyn Fn(&PeerId, i32) + Send + Sync>,
+	report_handle: Box<dyn Fn(&PeerId, ReputationChange) + Send + Sync>,
 	inner: RwLock<Inner<C>>,
 }
 
@@ -522,7 +660,7 @@ impl<C: ChainContext + ?Sized> MessageValidator<C> {
 	#[cfg(test)]
 	fn new_test(
 		chain: C,
-		report_handle: Box<dyn Fn(&PeerId, i32) + Send + Sync>,
+		report_handle: Box<dyn Fn(&PeerId, ReputationChange) + Send + Sync>,
 	) -> Self where C: Sized {
 		MessageValidator {
 			report_handle,
@@ -530,17 +668,18 @@ impl<C: ChainContext + ?Sized> MessageValidator<C> {
 				peers: HashMap::new(),
 				attestation_view: Default::default(),
 				message_routing_view: Default::default(),
+				availability_store: None,
 				chain,
 			}),
 		}
 	}
 
-	fn report(&self, who: &PeerId, cost_benefit: i32) {
+	fn report(&self, who: &PeerId, cost_benefit: ReputationChange) {
 		(self.report_handle)(who, cost_benefit)
 	}
 }
 
-impl<C: ChainContext + ?Sized> network_gossip::Validator<Block> for MessageValidator<C> {
+impl<C: ChainContext + ?Sized> sc_network_gossip::Validator<Block> for MessageValidator<C> {
 	fn new_peer(&self, _context: &mut dyn ValidatorContext<Block>, who: &PeerId, _roles: Roles) {
 		let mut inner = self.inner.write();
 		inner.peers.insert(who.clone(), PeerData::default());
@@ -587,6 +726,9 @@ impl<C: ChainContext + ?Sized> network_gossip::Validator<Block> for MessageValid
 					context.broadcast_message(topic.clone(), data.to_vec(), false);
 				}
 				(res, cb)
+			}
+			Ok(GossipMessage::ErasureChunk(chunk)) => {
+				self.inner.write().validate_erasure_chunk_packet(chunk)
 			}
 		};
 
@@ -655,12 +797,12 @@ impl<C: ChainContext + ?Sized> network_gossip::Validator<Block> for MessageValid
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use substrate_network::consensus_gossip::Validator as ValidatorT;
+	use sc_network_gossip::Validator as ValidatorT;
 	use std::sync::mpsc;
 	use parking_lot::Mutex;
 	use polkadot_primitives::parachain::{CandidateReceipt, HeadData};
-	use substrate_primitives::crypto::UncheckedInto;
-	use substrate_primitives::sr25519::{Public as Sr25519Public, Signature as Sr25519Signature};
+	use sp_core::crypto::UncheckedInto;
+	use sp_core::sr25519::{Public as Sr25519Public, Signature as Sr25519Signature};
 	use polkadot_validation::GenericStatement;
 	use super::message_routing::queue_topic;
 
@@ -685,7 +827,7 @@ mod tests {
 		}
 	}
 
-	impl network_gossip::ValidatorContext<Block> for MockValidatorContext {
+	impl sc_network_gossip::ValidatorContext<Block> for MockValidatorContext {
 		fn broadcast_topic(&mut self, topic: Hash, force: bool) {
 			self.events.push(ContextEvent::BroadcastTopic(topic, force));
 		}
@@ -701,12 +843,12 @@ mod tests {
 	}
 
 	impl NewLeafActions {
-		fn has_message(&self, who: PeerId, message: ConsensusMessage) -> bool {
+		fn has_message(&self, who: PeerId, message: GossipMessage) -> bool {
 			let x = NewLeafAction::TargetedMessage(who, message);
 			self.actions.iter().find(|&m| m == &x).is_some()
 		}
 
-		fn has_multicast(&self, topic: Hash, message: ConsensusMessage) -> bool {
+		fn has_multicast(&self, topic: Hash, message: GossipMessage) -> bool {
 			let x = NewLeafAction::Multicast(topic, message);
 			self.actions.iter().find(|&m| m == &x).is_some()
 		}
@@ -720,7 +862,7 @@ mod tests {
 	fn message_allowed() {
 		let (tx, _rx) = mpsc::channel();
 		let tx = Mutex::new(tx);
-		let report_handle = Box::new(move |peer: &PeerId, cb: i32| tx.lock().send((peer.clone(), cb)).unwrap());
+		let report_handle = Box::new(move |peer: &PeerId, cb: ReputationChange| tx.lock().send((peer.clone(), cb)).unwrap());
 		let validator = MessageValidator::new_test(
 			TestChainContext::default(),
 			report_handle,
@@ -769,6 +911,7 @@ mod tests {
 			fees: 1_000_000,
 			block_data_hash: [20u8; 32].into(),
 			upward_messages: Vec::new(),
+			erasure_root: [1u8; 32].into(),
 		};
 
 		let statement = GossipMessage::Statement(GossipStatement {
@@ -792,9 +935,10 @@ mod tests {
 
 		{
 			let mut message_allowed = validator.message_allowed();
-			assert!(message_allowed(&peer_a, MessageIntent::Broadcast, &topic_a, &encoded));
-			assert!(!message_allowed(&peer_a, MessageIntent::Broadcast, &topic_b, &encoded));
-			assert!(!message_allowed(&peer_a, MessageIntent::Broadcast, &topic_c, &encoded));
+			let intent = MessageIntent::Broadcast;
+			assert!(message_allowed(&peer_a, intent, &topic_a, &encoded));
+			assert!(!message_allowed(&peer_a, intent, &topic_b, &encoded));
+			assert!(!message_allowed(&peer_a, intent, &topic_c, &encoded));
 		}
 	}
 
@@ -802,7 +946,7 @@ mod tests {
 	fn too_many_chain_heads_is_report() {
 		let (tx, rx) = mpsc::channel();
 		let tx = Mutex::new(tx);
-		let report_handle = Box::new(move |peer: &PeerId, cb: i32| tx.lock().send((peer.clone(), cb)).unwrap());
+		let report_handle = Box::new(move |peer: &PeerId, cb: ReputationChange| tx.lock().send((peer.clone(), cb)).unwrap());
 		let validator = MessageValidator::new_test(
 			TestChainContext::default(),
 			report_handle,
@@ -844,7 +988,7 @@ mod tests {
 	fn statement_only_sent_when_candidate_known() {
 		let (tx, _rx) = mpsc::channel();
 		let tx = Mutex::new(tx);
-		let report_handle = Box::new(move |peer: &PeerId, cb: i32| tx.lock().send((peer.clone(), cb)).unwrap());
+		let report_handle = Box::new(move |peer: &PeerId, cb: ReputationChange| tx.lock().send((peer.clone(), cb)).unwrap());
 		let validator = MessageValidator::new_test(
 			TestChainContext::default(),
 			report_handle,
@@ -921,7 +1065,7 @@ mod tests {
 	fn multicasts_icmp_queues_when_building_on_new_leaf() {
 		let (tx, _rx) = mpsc::channel();
 		let tx = Mutex::new(tx);
-		let report_handle = Box::new(move |peer: &PeerId, cb: i32| tx.lock().send((peer.clone(), cb)).unwrap());
+		let report_handle = Box::new(move |peer: &PeerId, cb: ReputationChange| tx.lock().send((peer.clone(), cb)).unwrap());
 
 		let hash_a = [1u8; 32].into();
 		let root_a = [11u8; 32].into();
@@ -989,12 +1133,12 @@ mod tests {
 
 			assert!(actions.has_message(peer_a.clone(), GossipMessage::from(NeighborPacket {
 				chain_heads: vec![hash_a],
-			}).to_consensus_message()));
+			})));
 
 			assert!(actions.has_multicast(root_a_topic, GossipMessage::from(GossipParachainMessages {
 				queue_root: root_a,
 				messages: root_a_messages.clone(),
-			}).to_consensus_message()));
+			})));
 		}
 
 		// ensure that we are allowed to multicast to a peer with same chain head,
@@ -1006,8 +1150,9 @@ mod tests {
 			}).encode();
 
 			let mut allowed = validator.inner.message_allowed();
-			assert!(allowed(&peer_a, MessageIntent::Broadcast, &root_a_topic, &message[..]));
-			assert!(!allowed(&peer_b, MessageIntent::Broadcast, &root_a_topic, &message[..]));
+			let intent = MessageIntent::Broadcast;
+			assert!(allowed(&peer_a, intent, &root_a_topic, &message[..]));
+			assert!(!allowed(&peer_b, intent, &root_a_topic, &message[..]));
 		}
 	}
 
@@ -1015,7 +1160,7 @@ mod tests {
 	fn multicasts_icmp_queues_on_neighbor_update() {
 		let (tx, _rx) = mpsc::channel();
 		let tx = Mutex::new(tx);
-		let report_handle = Box::new(move |peer: &PeerId, cb: i32| tx.lock().send((peer.clone(), cb)).unwrap());
+		let report_handle = Box::new(move |peer: &PeerId, cb: ReputationChange| tx.lock().send((peer.clone(), cb)).unwrap());
 
 		let hash_a = [1u8; 32].into();
 		let root_a = [11u8; 32].into();
@@ -1060,12 +1205,12 @@ mod tests {
 
 			assert!(actions.has_message(peer_a.clone(), GossipMessage::from(NeighborPacket {
 				chain_heads: vec![hash_a],
-			}).to_consensus_message()));
+			})));
 
 			assert!(actions.has_multicast(root_a_topic, GossipMessage::from(GossipParachainMessages {
 				queue_root: root_a,
 				messages: root_a_messages.clone(),
-			}).to_consensus_message()));
+			})));
 		}
 
 		// ensure that we are not allowed to multicast to either peer, as they
@@ -1074,11 +1219,12 @@ mod tests {
 			let message = GossipMessage::from(GossipParachainMessages {
 				queue_root: root_a,
 				messages: root_a_messages.clone(),
-			}).encode();
+			});
 
 			let mut allowed = validator.inner.message_allowed();
-			assert!(!allowed(&peer_a, MessageIntent::Broadcast, &root_a_topic, &message[..]));
-			assert!(!allowed(&peer_b, MessageIntent::Broadcast, &root_a_topic, &message[..]));
+			let intent = MessageIntent::Broadcast;
+			assert!(!allowed(&peer_a, intent, &root_a_topic, &message.encode()));
+			assert!(!allowed(&peer_b, intent, &root_a_topic, &message.encode()));
 		}
 
 		// peer A gets updated to the chain head. now we'll attempt to broadcast
@@ -1115,8 +1261,9 @@ mod tests {
 			}).encode();
 
 			let mut allowed = validator.inner.message_allowed();
-			assert!(allowed(&peer_a, MessageIntent::Broadcast, &root_a_topic, &message[..]));
-			assert!(!allowed(&peer_b, MessageIntent::Broadcast, &root_a_topic, &message[..]));
+			let intent = MessageIntent::Broadcast;
+			assert!(allowed(&peer_a, intent, &root_a_topic, &message[..]));
+			assert!(!allowed(&peer_b, intent, &root_a_topic, &message[..]));
 		}
 	}
 
@@ -1124,7 +1271,7 @@ mod tests {
 	fn accepts_needed_unknown_icmp_message_queue() {
 		let (tx, _rx) = mpsc::channel();
 		let tx = Mutex::new(tx);
-		let report_handle = Box::new(move |peer: &PeerId, cb: i32| tx.lock().send((peer.clone(), cb)).unwrap());
+		let report_handle = Box::new(move |peer: &PeerId, cb: ReputationChange| tx.lock().send((peer.clone(), cb)).unwrap());
 
 		let hash_a = [1u8; 32].into();
 		let root_a_messages = vec![
@@ -1163,17 +1310,17 @@ mod tests {
 		let queue_messages = GossipMessage::from(GossipParachainMessages {
 			queue_root: root_a,
 			messages: root_a_messages.clone(),
-		}).to_consensus_message();
+		});
 
 		let not_queue_messages = GossipMessage::from(GossipParachainMessages {
 			queue_root: root_a,
 			messages: not_root_a_messages.clone(),
-		}).encode();
+		});
 
 		let queue_messages_wrong_root = GossipMessage::from(GossipParachainMessages {
 			queue_root: not_root_a,
 			messages: root_a_messages.clone(),
-		}).encode();
+		});
 
 		// ensure that we attempt to multicast all relevant queues after noting a leaf.
 		{
@@ -1185,7 +1332,7 @@ mod tests {
 
 			assert!(actions.has_message(peer_a.clone(), GossipMessage::from(NeighborPacket {
 				chain_heads: vec![hash_a],
-			}).to_consensus_message()));
+			})));
 
 			// we don't know this queue! no broadcast :(
 			assert!(!actions.has_multicast(root_a_topic, queue_messages.clone()));
@@ -1196,7 +1343,7 @@ mod tests {
 			let res = validator.inner.validate(
 				&mut validator_context,
 				&peer_a,
-				&queue_messages_wrong_root[..],
+				&queue_messages_wrong_root.encode(),
 			);
 
 			match res {
@@ -1212,7 +1359,7 @@ mod tests {
 			let res = validator.inner.validate(
 				&mut validator_context,
 				&peer_a,
-				&not_queue_messages[..],
+				&not_queue_messages.encode(),
 			);
 
 			match res {
@@ -1228,7 +1375,7 @@ mod tests {
 			let res = validator.inner.validate(
 				&mut validator_context,
 				&peer_a,
-				&queue_messages.data[..],
+				&queue_messages.encode(),
 			);
 
 			match res {
@@ -1237,7 +1384,7 @@ mod tests {
 			}
 
 			assert_eq!(validator_context.events, vec![
-				ContextEvent::BroadcastMessage(root_a_topic, queue_messages.data.clone(), false),
+				ContextEvent::BroadcastMessage(root_a_topic, queue_messages.encode(), false),
 			]);
 		}
 	}

@@ -16,6 +16,7 @@ image:                             parity/rust-builder:latest
 
 variables:
   GIT_STRATEGY:                    fetch
+  GIT_DEPTH:                       100
   CARGO_HOME:                      "/ci-cache/${CI_PROJECT_NAME}/cargo/${CI_JOB_NAME}"
   SCCACHE_DIR:                     "/ci-cache/${CI_PROJECT_NAME}/sccache"
   CI_SERVER_NAME:                  "GitLab CI"
@@ -40,10 +41,12 @@ variables:
 .docker-env:                       &docker-env
   retry:
     max: 2
-    when: 
+    when:
       - runner_system_failure
       - unknown_failure
       - api_failure
+  interruptible:                   true
+  dependencies:                    []
   tags:
     - linux-docker
 
@@ -80,7 +83,44 @@ variables:
 
 
 
+#### stage:                        test
 
+check-runtime:
+  stage:                           test
+  image:                           parity/tools:latest
+  <<:                              *kubernetes-env
+  only:
+    - /^[0-9]+$/
+  variables:
+    GITLAB_API:                    "https://gitlab.parity.io/api/v4"
+    GITHUB_API_PROJECT:            "parity%2Finfrastructure%2Fgithub-api"
+  script:
+    - ./scripts/gitlab/check_runtime.sh
+  interruptible:                   true
+  allow_failure:                   true
+
+
+check-line-width:
+  stage:                           test
+  image:                           parity/tools:latest
+  <<:                              *kubernetes-env
+  only:
+    - /^[0-9]+$/
+  script:
+    - ./scripts/gitlab/check_line_width.sh
+  interruptible:                   true
+  allow_failure:                   true
+
+alert-pending-release:
+  stage:                           test
+  image:                           parity/tools:latest
+  only:
+    - tags
+    - /^v[0-9]+\.[0-9]+\.[0-9]+.*$/        # i.e. v1.0.1, v2.1.0rc1
+  script:
+    - ./scripts/gitlab/alert_pending_release.sh
+  interruptible:                   true
+  allow_failure:                   true
 
 test-linux-stable:                 &test
   stage:                           test
@@ -104,6 +144,22 @@ test-linux-stable:                 &test
     - sccache -s
 
 
+check-web-wasm:                    &test
+  stage:                           test
+  <<:                              *test-refs
+  <<:                              *docker-env
+  <<:                              *compiler_info
+  script:
+    # WASM support is in progress. As more and more crates support WASM, we
+    # should add entries here. See https://github.com/paritytech/polkadot/issues/625
+    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path runtime/polkadot/Cargo.toml
+    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path runtime/kusama/Cargo.toml
+    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path erasure-coding/Cargo.toml
+    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path parachain/Cargo.toml
+    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path primitives/Cargo.toml
+    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path rpc/Cargo.toml
+    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path statement-table/Cargo.toml
+    - sccache -s
 
 
 build-linux-release:               &build
@@ -122,18 +178,13 @@ build-linux-release:               &build
     - mkdir -p ./artifacts
     - mv ./target/release/polkadot ./artifacts/.
     - sha256sum ./artifacts/polkadot | tee ./artifacts/polkadot.sha256
+    - VERSION="${CI_COMMIT_REF_NAME}" # will be tag or branch name
     - if [ "${CI_COMMIT_TAG}" ]; then
-        VERSION="${CI_COMMIT_TAG}";
-      else
-        VERSION="$(./artifacts/polkadot --version |
-          sed -n -r 's/^polkadot ([0-9.]+.*-[0-9a-f]{7,13})-.*$/\1/p')";
-        VERSION="${VERSION}-$(cut -c 1-8 ./artifacts/polkadot.sha256)";
-      fi
-    - LATEST_BRANCH="$(ls -1 .git/refs/remotes/origin/ | sed -r -n 's:v([0-9]+)\.([0-9]+):v\1.\2:p' | sort -V | tail -n1)"
-    - if expr match x${CI_COMMIT_TAG} x${LATEST_BRANCH}; then
         EXTRATAG="latest";
       else
-        EXTRATAG="latest-${CI_COMMIT_REF_NAME}";
+        EXTRATAG="$(./artifacts/polkadot --version |
+          sed -n -r 's/^polkadot ([0-9.]+.*-[0-9a-f]{7,13})-.*$/\1/p')";
+        EXTRATAG="${CI_COMMIT_REF_NAME}-${EXTRATAG}-$(cut -c 1-8 ./artifacts/polkadot.sha256)";
       fi
     - echo "Polkadot version = ${VERSION} (EXTRATAG ${EXTRATAG})"
     - echo -n ${VERSION} > ./artifacts/VERSION
@@ -182,7 +233,7 @@ publish-docker-release:
     - docker build
       --build-arg VCS_REF="${CI_COMMIT_SHA}"
       --build-arg BUILD_DATE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-      --tag $CONTAINER_IMAGE:$VERSION 
+      --tag $CONTAINER_IMAGE:$VERSION
       --tag $CONTAINER_IMAGE:$EXTRATAG .
     - docker push $CONTAINER_IMAGE:$VERSION
     - docker push $CONTAINER_IMAGE:$EXTRATAG
@@ -214,6 +265,20 @@ publish-s3-release:
   after_script:
     - aws s3 ls s3://${BUCKET}/${PREFIX}/${EXTRATAG}/
         --recursive --human-readable --summarize
+
+
+
+
+publish-draft-release:
+  stage:                           deploy
+  image:                           parity/tools:latest
+  only:
+    - tags
+    - /^v[0-9]+\.[0-9]+\.[0-9]+.*$/        # i.e. v1.0.1, v2.1.0rc1
+  script:
+    - ./scripts/gitlab/publish_draft_release.sh
+  interruptible:                   true
+  allow_failure:                   true
 
 
 
@@ -305,6 +370,7 @@ deploy-polkasync-kusama:
   variables:
     GITLAB_API:                    "https://gitlab.parity.io/api/v4"
     GITHUB_API_PROJECT:            "parity%2Finfrastructure%2Fparity-testnet"
+    GIT_STRATEGY:                  none
   allow_failure:                   true
   script:
     - |
@@ -314,6 +380,5 @@ deploy-polkasync-kusama:
         -F "ref=master" \
         -F "variables[POLKADOT_BUILD_REF]=${CI_COMMIT_REF_NAME}" \
         ${GITLAB_API}/projects/${GITHUB_API_PROJECT}/trigger/pipeline | jq .
-
 
 

@@ -1,4 +1,4 @@
-// Copyright 2018 Parity Technologies (UK) Ltd.
+// Copyright 2018-2020 Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -21,18 +21,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use adder::{HeadData as AdderHead, BlockData as AdderBody};
-use substrate_primitives::{Pair, Blake2Hasher};
-use parachain::codec::{Encode, Decode};
+use sp_core::Pair;
+use codec::{Encode, Decode};
 use primitives::{
-	Hash, Block,
+	Hash,
 	parachain::{
 		HeadData, BlockData, Id as ParaId, Message, OutgoingMessages, Status as ParachainStatus,
 	},
 };
 use collator::{
-	InvalidHead, ParachainContext, VersionInfo, Network, BuildParachainContext, TaskExecutor,
+	InvalidHead, ParachainContext, Network, BuildParachainContext, load_spec, Configuration,
 };
 use parking_lot::Mutex;
+use futures::future::{Ready, ok, err};
 
 const GENESIS: AdderHead = AdderHead {
 	number: 0,
@@ -57,17 +58,19 @@ struct AdderContext {
 
 /// The parachain context.
 impl ParachainContext for AdderContext {
-	type ProduceCandidate = Result<(BlockData, HeadData, OutgoingMessages), InvalidHead>;
+	type ProduceCandidate = Ready<Result<(BlockData, HeadData, OutgoingMessages), InvalidHead>>;
 
 	fn produce_candidate<I: IntoIterator<Item=(ParaId, Message)>>(
 		&mut self,
 		_relay_parent: Hash,
 		status: ParachainStatus,
 		ingress: I,
-	) -> Result<(BlockData, HeadData, OutgoingMessages), InvalidHead>
+	) -> Self::ProduceCandidate
 	{
-		let adder_head = AdderHead::decode(&mut &status.head_data.0[..])
-			.map_err(|_| InvalidHead)?;
+		let adder_head = match AdderHead::decode(&mut &status.head_data.0[..]) {
+			Ok(adder_head) => adder_head,
+			Err(_) => return err(InvalidHead)
+		};
 
 		let mut db = self.db.lock();
 
@@ -98,23 +101,19 @@ impl ParachainContext for AdderContext {
 			next_head.number, next_body.state.overflowing_add(next_body.add).0);
 
 		db.insert(next_head.clone(), next_body);
-		Ok((encoded_body, encoded_head, OutgoingMessages { outgoing_messages: Vec::new() }))
+		ok((encoded_body, encoded_head, OutgoingMessages { outgoing_messages: Vec::new() }))
 	}
 }
 
 impl BuildParachainContext for AdderContext {
 	type ParachainContext = Self;
 
-	fn build<B, E>(
+	fn build<B, E, R, SP, Extrinsic>(
 		self,
-		_: Arc<collator::PolkadotClient<B, E>>,
-		_: TaskExecutor,
+		_: Arc<collator::PolkadotClient<B, E, R>>,
+		_: SP,
 		network: Arc<dyn Network>,
-	) -> Result<Self::ParachainContext, ()>
-		where
-			B: client::backend::Backend<Block, Blake2Hasher> + 'static,
-			E: client::CallExecutor<Block, Blake2Hasher> + Clone + Send + Sync + 'static
-	{
+	) -> Result<Self::ParachainContext, ()> {
 		Ok(Self { _network: Some(network), ..self })
 	}
 }
@@ -142,7 +141,7 @@ fn main() {
 	let exit_send_cell = RefCell::new(Some(exit_send));
 	ctrlc::set_handler(move || {
 		if let Some(exit_send) = exit_send_cell.try_borrow_mut().expect("signal handler not reentrant; qed").take() {
-			exit_send.fire();
+			let _ = exit_send.fire();
 		}
 	}).expect("Error setting up ctrl-c handler");
 
@@ -151,20 +150,12 @@ fn main() {
 		_network: None,
 	};
 
-	let res = ::collator::run_collator(
+	let res = collator::run_collator(
 		context,
 		id,
 		exit,
 		key,
-		VersionInfo {
-			name: "<unknown>",
-			version: "<unknown>",
-			commit: "<unknown>",
-			executable_name: "adder-collator",
-			description: "collator for adder parachain",
-			author: "parity technologies",
-			support_url: "https://github.com/paritytech/polkadot/issues/new",
-		}
+		Configuration::default_with_spec_and_base_path(load_spec("dev").unwrap().unwrap(), None),
 	);
 
 	if let Err(e) = res {

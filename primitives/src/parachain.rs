@@ -1,4 +1,4 @@
-// Copyright 2017 Parity Technologies (UK) Ltd.
+// Copyright 2017-2020 Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -28,14 +28,22 @@ use serde::{Serialize, Deserialize};
 #[cfg(feature = "std")]
 use primitives::bytes;
 use primitives::RuntimeDebug;
+use inherents::InherentIdentifier;
 use application_crypto::KeyTypeId;
 
+#[cfg(feature = "std")]
+use trie::TrieConfiguration;
+
 pub use polkadot_parachain::{
-	Id, ParachainDispatchOrigin, LOWEST_USER_ID, UpwardMessage,
+	Id, ParachainDispatchOrigin, LOWEST_USER_ID, UpwardMessage, TargetedMessage,
 };
 
 /// The key type ID for a collator key.
 pub const COLLATOR_KEY_TYPE_ID: KeyTypeId = KeyTypeId(*b"coll");
+
+/// An identifier for inherent data that provides new minimally-attested
+/// parachain heads.
+pub const NEW_HEADS_IDENTIFIER: InherentIdentifier = *b"newheads";
 
 mod collator_app {
 	use application_crypto::{app_crypto, sr25519};
@@ -156,36 +164,6 @@ pub struct DutyRoster {
 	pub validator_duty: Vec<Chain>,
 }
 
-/// A message targeted to a specific parachain.
-#[derive(Clone, PartialEq, Eq, Encode, Decode)]
-#[cfg_attr(feature = "std", derive(Serialize, Deserialize, Debug))]
-#[cfg_attr(feature = "std", serde(rename_all = "camelCase"))]
-#[cfg_attr(feature = "std", serde(deny_unknown_fields))]
-pub struct TargetedMessage {
-	/// The target parachain.
-	pub target: Id,
-	/// The message data.
-	pub data: Vec<u8>,
-}
-
-impl AsRef<[u8]> for TargetedMessage {
-	fn as_ref(&self) -> &[u8] {
-		&self.data[..]
-	}
-}
-
-impl PartialOrd for TargetedMessage {
-	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-		Some(self.target.cmp(&other.target))
-	}
-}
-
-impl Ord for TargetedMessage {
-	fn cmp(&self, other: &Self) -> Ordering {
-		self.target.cmp(&other.target)
-	}
-}
-
 /// Outgoing message data for a parachain candidate.
 ///
 /// This is data produced by evaluating the candidate. It contains
@@ -227,9 +205,84 @@ impl OutgoingMessages {
 	}
 }
 
+/// Messages by queue root that are stored in the availability store.
+#[derive(PartialEq, Clone, Decode)]
+#[cfg_attr(feature = "std", derive(Serialize, Deserialize, Encode, Debug))]
+pub struct AvailableMessages(pub Vec<(Hash, Vec<Message>)>);
+
+
+/// Compute a trie root for a set of messages, given the raw message data.
+#[cfg(feature = "std")]
+pub fn message_queue_root<A, I: IntoIterator<Item=A>>(messages: I) -> Hash
+	where A: AsRef<[u8]>
+{
+	trie::trie_types::Layout::<primitives::Blake2Hasher>::ordered_trie_root(messages)
+}
+
+#[cfg(feature = "std")]
+impl From<OutgoingMessages> for AvailableMessages {
+	fn from(outgoing: OutgoingMessages) -> Self {
+		let queues = outgoing.message_queues().filter_map(|queue| {
+			let queue_root = message_queue_root(queue);
+			let queue_data = queue.iter().map(|msg| msg.clone().into()).collect();
+			Some((queue_root, queue_data))
+		}).collect();
+
+		AvailableMessages(queues)
+	}
+}
+
 /// Candidate receipt type.
 #[derive(PartialEq, Eq, Clone, Encode, Decode)]
 #[cfg_attr(feature = "std", derive(Debug))]
+pub struct CollationInfo {
+	/// The ID of the parachain this is a candidate for.
+	pub parachain_index: Id,
+	/// The collator's relay-chain account ID
+	pub collator: CollatorId,
+	/// Signature on blake2-256 of the block data by collator.
+	pub signature: CollatorSignature,
+	/// Egress queue roots. Must be sorted lexicographically (ascending)
+	/// by parachain ID.
+	pub egress_queue_roots: Vec<(Id, Hash)>,
+	/// The head-data
+	pub head_data: HeadData,
+	/// blake2-256 Hash of block data.
+	pub block_data_hash: Hash,
+	/// Messages destined to be interpreted by the Relay chain itself.
+	pub upward_messages: Vec<UpwardMessage>,
+}
+
+impl From<CandidateReceipt> for CollationInfo {
+	fn from(receipt: CandidateReceipt) -> Self {
+		CollationInfo {
+			parachain_index: receipt.parachain_index,
+			collator: receipt.collator,
+			signature: receipt.signature,
+			egress_queue_roots: receipt.egress_queue_roots,
+			head_data: receipt.head_data,
+			block_data_hash: receipt.block_data_hash,
+			upward_messages: receipt.upward_messages,
+		}
+	}
+}
+
+impl CollationInfo {
+	/// Check integrity vs. provided block data.
+	pub fn check_signature(&self) -> Result<(), ()> {
+		use runtime_primitives::traits::AppVerify;
+
+		if self.signature.verify(self.block_data_hash.as_ref(), &self.collator) {
+			Ok(())
+		} else {
+			Err(())
+		}
+	}
+}
+
+/// Candidate receipt type.
+#[derive(PartialEq, Eq, Clone, Encode, Decode)]
+#[cfg_attr(feature = "std", derive(Debug, Default))]
 pub struct CandidateReceipt {
 	/// The ID of the parachain this is a candidate for.
 	pub parachain_index: Id,
@@ -248,6 +301,8 @@ pub struct CandidateReceipt {
 	pub block_data_hash: Hash,
 	/// Messages destined to be interpreted by the Relay chain itself.
 	pub upward_messages: Vec<UpwardMessage>,
+	/// The root of a block's erasure encoding Merkle tree.
+	pub erasure_root: Hash,
 }
 
 impl CandidateReceipt {
@@ -275,6 +330,18 @@ impl PartialOrd for CandidateReceipt {
 	}
 }
 
+impl PartialEq<CollationInfo> for CandidateReceipt {
+	fn eq(&self, info: &CollationInfo) -> bool {
+		self.parachain_index == info.parachain_index &&
+		self.collator == info.collator &&
+		self.signature == info.signature &&
+		self.egress_queue_roots == info.egress_queue_roots &&
+		self.head_data == info.head_data &&
+		self.block_data_hash == info.block_data_hash &&
+		self.upward_messages == info.upward_messages
+	}
+}
+
 impl Ord for CandidateReceipt {
 	fn cmp(&self, other: &Self) -> Ordering {
 		// TODO: compare signatures or something more sane
@@ -289,7 +356,7 @@ impl Ord for CandidateReceipt {
 #[cfg_attr(feature = "std", derive(Debug, Encode, Decode))]
 pub struct Collation {
 	/// Candidate receipt itself.
-	pub receipt: CandidateReceipt,
+	pub info: CollationInfo,
 	/// A proof-of-validation for the receipt.
 	pub pov: PoVBlock,
 }
@@ -369,6 +436,18 @@ pub struct ConsolidatedIngress(pub Vec<(Id, Vec<Message>)>);
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize, Debug))]
 pub struct BlockData(#[cfg_attr(feature = "std", serde(with="bytes"))] pub Vec<u8>);
 
+/// A chunk of erasure-encoded block data.
+#[derive(PartialEq, Eq, Clone, Encode, Decode, Default)]
+#[cfg_attr(feature = "std", derive(Serialize, Deserialize, Debug))]
+pub struct ErasureChunk {
+	/// The erasure-encoded chunk of data belonging to the candidate block.
+	pub chunk: Vec<u8>,
+	/// The index of this erasure-encoded chunk of data.
+	pub index: u32,
+	/// Proof for this chunk's branch in the Merkle tree.
+	pub proof: Vec<Vec<u8>>,
+}
+
 impl BlockData {
 	/// Compute hash of block data.
 	#[cfg(feature = "std")]
@@ -384,7 +463,7 @@ pub struct Header(#[cfg_attr(feature = "std", serde(with="bytes"))] pub Vec<u8>)
 
 /// Parachain head data included in the chain.
 #[derive(PartialEq, Eq, Clone, PartialOrd, Ord, Encode, Decode)]
-#[cfg_attr(feature = "std", derive(Serialize, Deserialize, Debug))]
+#[cfg_attr(feature = "std", derive(Serialize, Deserialize, Debug, Default))]
 pub struct HeadData(#[cfg_attr(feature = "std", serde(with="bytes"))] pub Vec<u8>);
 
 /// Parachain validation code.
@@ -483,8 +562,11 @@ pub struct Status {
 	pub fee_schedule: FeeSchedule,
 }
 
-substrate_client::decl_runtime_apis! {
+use runtime_primitives::traits::{Block as BlockT};
+
+sp_api::decl_runtime_apis! {
 	/// The API for querying the state of parachains on-chain.
+	#[api_version(2)]
 	pub trait ParachainHost {
 		/// Get the current validators.
 		fn validators() -> Vec<ValidatorId>;
@@ -502,12 +584,14 @@ substrate_client::decl_runtime_apis! {
 		/// If `since` is provided, only messages since (including those in) that block
 		/// will be included.
 		fn ingress(to: Id, since: Option<BlockNumber>) -> Option<StructuredUnroutedIngress>;
+		/// Extract the heads that were set by this set of extrinsics.
+		fn get_heads(extrinsics: Vec<<Block as BlockT>::Extrinsic>) -> Option<Vec<CandidateReceipt>>;
 	}
 }
 
 /// Runtime ID module.
 pub mod id {
-	use sr_version::ApiId;
+	use sp_version::ApiId;
 
 	/// Parachain host runtime API id.
 	pub const PARACHAIN_HOST: ApiId = *b"parahost";
