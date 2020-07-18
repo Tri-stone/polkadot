@@ -20,14 +20,14 @@
 //! The way we accomplish this is by erasure coding the data into n pieces
 //! and constructing a merkle root of the data.
 //!
-//! Each of n validators stores their piece of data. We assume n=3f+k, k < 3.
+//! Each of n validators stores their piece of data. We assume n=3f+k, 0 < k ≤ 3.
 //! f is the maximum number of faulty validators in the system.
 //! The data is coded so any f+1 chunks can be used to reconstruct the full data.
 
 use codec::{Encode, Decode};
 use reed_solomon::galois_16::{self, ReedSolomon};
-use primitives::{Hash as H256, BlakeTwo256, HashT};
-use primitives::parachain::{BlockData, AvailableMessages};
+use primitives::v0::{self, Hash as H256, BlakeTwo256, HashT};
+use primitives::v1;
 use sp_core::Blake2Hasher;
 use trie::{EMPTY_PREFIX, MemoryDB, Trie, TrieMut, trie_types::{TrieDBMut, TrieDB}};
 
@@ -65,6 +65,8 @@ pub enum Error {
 	/// Branch out of bounds.
 	BranchOutOfBounds,
 }
+
+impl std::error::Error for Error { }
 
 #[derive(Debug, PartialEq)]
 struct CodeParams {
@@ -122,14 +124,32 @@ fn code_params(n_validators: usize) -> Result<CodeParams, Error> {
 	})
 }
 
+/// Obtain erasure-coded chunks for v0 `AvailableData`, one for each validator.
+///
+/// Works only up to 65536 validators, and `n_validators` must be non-zero.
+pub fn obtain_chunks_v0(n_validators: usize, data: &v0::AvailableData)
+	-> Result<Vec<Vec<u8>>, Error>
+{
+	obtain_chunks(n_validators, data)
+}
+
+/// Obtain erasure-coded chunks for v1 `AvailableData`, one for each validator.
+///
+/// Works only up to 65536 validators, and `n_validators` must be non-zero.
+pub fn obtain_chunks_v1(n_validators: usize, data: &v1::AvailableData)
+	-> Result<Vec<Vec<u8>>, Error>
+{
+	obtain_chunks(n_validators, data)
+}
+
 /// Obtain erasure-coded chunks, one for each validator.
 ///
 /// Works only up to 65536 validators, and `n_validators` must be non-zero.
-pub fn obtain_chunks(n_validators: usize, block_data: &BlockData, outgoing: Option<&AvailableMessages>)
+fn obtain_chunks<T: Encode>(n_validators: usize, data: &T)
 	-> Result<Vec<Vec<u8>>, Error>
 {
 	let params = code_params(n_validators)?;
-	let encoded = (block_data, outgoing).encode();
+	let encoded = data.encode();
 
 	if encoded.is_empty() {
 		return Err(Error::BadPayload);
@@ -143,15 +163,42 @@ pub fn obtain_chunks(n_validators: usize, block_data: &BlockData, outgoing: Opti
 	Ok(shards.into_iter().map(|w| w.into_inner()).collect())
 }
 
-/// Reconstruct the block data from a set of chunks.
+/// Reconstruct the v0 available data from a set of chunks.
 ///
 /// Provide an iterator containing chunk data and the corresponding index.
 /// The indices of the present chunks must be indicated. If too few chunks
 /// are provided, recovery is not possible.
 ///
 /// Works only up to 65536 validators, and `n_validators` must be non-zero.
-pub fn reconstruct<'a, I: 'a>(n_validators: usize, chunks: I)
-	-> Result<(BlockData, Option<AvailableMessages>), Error>
+pub fn reconstruct_v0<'a, I: 'a>(n_validators: usize, chunks: I)
+	-> Result<v0::AvailableData, Error>
+	where I: IntoIterator<Item=(&'a [u8], usize)>
+{
+	reconstruct(n_validators, chunks)
+}
+
+/// Reconstruct the v1 available data from a set of chunks.
+///
+/// Provide an iterator containing chunk data and the corresponding index.
+/// The indices of the present chunks must be indicated. If too few chunks
+/// are provided, recovery is not possible.
+///
+/// Works only up to 65536 validators, and `n_validators` must be non-zero.
+pub fn reconstruct_v1<'a, I: 'a>(n_validators: usize, chunks: I)
+	-> Result<v1::AvailableData, Error>
+	where I: IntoIterator<Item=(&'a [u8], usize)>
+{
+	reconstruct(n_validators, chunks)
+}
+
+/// Reconstruct decodable data from a set of chunks.
+///
+/// Provide an iterator containing chunk data and the corresponding index.
+/// The indices of the present chunks must be indicated. If too few chunks
+/// are provided, recovery is not possible.
+///
+/// Works only up to 65536 validators, and `n_validators` must be non-zero.
+fn reconstruct<'a, I: 'a, T: Decode>(n_validators: usize, chunks: I) -> Result<T, Error>
 	where I: IntoIterator<Item=(&'a [u8], usize)>
 {
 	let params = code_params(n_validators)?;
@@ -341,6 +388,7 @@ impl<'a, I: Iterator<Item=&'a [u8]>> codec::Input for ShardInput<'a, I> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use primitives::v0::{AvailableData, BlockData, PoVBlock};
 
 	#[test]
 	fn field_order_is_right_size() {
@@ -400,19 +448,24 @@ mod tests {
 	}
 
     #[test]
-	fn round_trip_block_data() {
-		let block_data = BlockData((0..255).collect());
-		let ex = Some(AvailableMessages(Vec::new()));
+	fn round_trip_works() {
+		let pov_block = PoVBlock {
+			block_data: BlockData((0..255).collect()),
+		};
+
+		let available_data = AvailableData {
+			pov_block,
+			omitted_validation: Default::default(),
+		};
 		let chunks = obtain_chunks(
 			10,
-			&block_data,
-			ex.as_ref(),
+			&available_data,
 		).unwrap();
 
 		assert_eq!(chunks.len(), 10);
 
 		// any 4 chunks should work.
-		let reconstructed = reconstruct(
+		let reconstructed: AvailableData = reconstruct(
 			10,
 			[
 				(&*chunks[1], 1),
@@ -422,18 +475,23 @@ mod tests {
 			].iter().cloned(),
 		).unwrap();
 
-		assert_eq!(reconstructed, (block_data, ex));
+		assert_eq!(reconstructed, available_data);
 	}
 
 	#[test]
 	fn construct_valid_branches() {
-		let block_data = BlockData(vec![2; 256]);
-		let ex = Some(AvailableMessages(Vec::new()));
+		let pov_block = PoVBlock {
+			block_data: BlockData(vec![2; 256]),
+		};
+
+		let available_data = AvailableData {
+			pov_block,
+			omitted_validation: Default::default(),
+		};
 
 		let chunks = obtain_chunks(
 			10,
-			&block_data,
-			ex.as_ref(),
+			&available_data,
 		).unwrap();
 
 		assert_eq!(chunks.len(), 10);
